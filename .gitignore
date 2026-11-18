@@ -1,0 +1,15 @@
+# Ignore the private runtime (venv, logs, Agent-S logs). It is rebuilt on demand.
+.runtime/
+
+# Agent-S writes its own logs into the working directory
+logs/
+*.log
+
+# Portable binaries are too large for normal git. Fetch them with
+# -PrepareVendor, or attach them to a GitHub Release instead.
+vendor/opencode/
+vendor/uv/
+
+# Python caches
+__pycache__/
+*.py[cod]
