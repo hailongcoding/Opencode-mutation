@@ -101,8 +101,6 @@ a copied folder cheap to rebuild. Useful switches:
 | `-Reinstall` | Wipe and rebuild `.runtime\venv` |
 | `-SelfTest` | Check every primitive (screenshot, clipboard, real Unicode typing into a scratch window the test owns, accessibility snapshot, element actions on a throwaway Run dialog, launch/wait, window list) without launching OpenCode |
 | `-PrepareVendor` | Copy portable OpenCode + uv into `vendor\` (toolchain only; Python and packages are still downloaded on first run) |
-| `-RefreshTools` | Re-download OpenCode/uv (pinned versions) |
-| `-LatestTools` | With `-RefreshTools`, use the newest upstream release |
 
 ## Portable bundle (no npm/Node)
 
@@ -140,46 +138,27 @@ asset instead of committing `vendor\`.
 Tool lookup order: `vendor\` → `.runtime\tools\` (auto-download cache) → `PATH`.
 That means an existing OpenCode/uv install is reused instead of downloading.
 
-## Updating: pinned by default
+## Version pinning (no updater)
 
-The defaults are pinned to a known-good set: **OpenCode 2.3.2**, **uv 0.11.28**,
-**Python 3.12**, and Agent-S 0.3.2 when installed from PyPI (a Git install uses
-the repo's `main`). There is no automatic updater, deliberately: the OpenCode
-binary, this MCP server, and Agent-S were tested together. An update is a change
-to the whole product, not a background chore.
+The launcher is intentionally frozen to a known-good set: **OpenCode 2.3.2**,
+**uv 0.11.28**, **Python 3.12**, and **gui-agents 0.3.2** when Agent-S comes from
+PyPI. There is no update command, no "latest" mode, and no background updater.
+The OpenCode binary, this MCP server, and Agent-S were tested together; silently
+swapping one component is more likely to break the MCP connection than to improve
+the setup.
 
-OpenCode and uv are official standalone Windows binaries. Updating them from
-GitHub Releases is a supported path, not an npm workaround:
+OpenCode still needs internet for models. The launcher's own files can be updated
+separately with `git pull` from
+<https://github.com/hailongcoding/Opencode-mutation> if you deliberately want a
+newer checkout.
 
-```powershell
-.\Computer-Use.cmd -RefreshTools -LatestTools -PrepareVendor
-```
-
-`-RefreshTools` downloads the newest official release, verifies the published
-SHA-256 where available, and `-PrepareVendor` copies it into `vendor\`. This never
-invokes npm, Node or Bun. OpenCode's own `opencode upgrade` also has a standalone
-method, but using the launcher keeps the version, location and checksum under its
-control.
-
-After any update:
-
-1. Run `.\Computer-Use.cmd -SelfTest`.
-2. Launch one session and confirm the `computer` tool group loads; the launcher
-   logs MCP startup in `.runtime\logs\sessions.log`.
-3. If anything regresses, restore the pins with
-   `.\Computer-Use.cmd -RefreshTools -PrepareVendor` (no `-LatestTools`).
-
-Python stays on 3.12 because Agent-S requires `<=3.12`; moving to 3.13/3.14 is not
-a performance win and can break the OCR/grounding stack. uv is only the installer,
-so a newer uv does not make the runtime faster. The practical policy is therefore:
-**freeze the stack, update OpenCode intentionally**, and only when a feature or fix
-is worth re-testing. If you want maximum reproducibility, Agent-S should be pinned
-to a tag/commit too, since Git `main` moves.
-
-The launcher's own files live at
-<https://github.com/hailongcoding/Opencode-mutation>. Update a checkout with
-`git pull`; a released ZIP plus checksum is the intended next step for PCs
-without Git.
+If a newer OpenCode is genuinely required, treat it as a development change: edit
+the `$script:OpenCodeVersion` / `$script:UvVersion` constants in
+`scripts\Start-ComputerUse.ps1`, delete the corresponding files under `vendor\`,
+then run `-PrepareVendor`, `-SelfTest`, and verify the `computer` tools in a real
+session. Keep the previous folder so you can roll back. Do not run
+`opencode upgrade` against this portable copy; it assumes an installer-managed
+installation and bypasses the launcher's pins.
 
 ---
 
@@ -248,7 +227,7 @@ So: no global grant, no always-on listener, no background agent.
 | Symptom | Fix |
 | --- | --- |
 | First run cannot download OpenCode/uv | Corporate proxy or restricted network. Run `-PrepareVendor` on a connected machine and copy the folder, or drop `opencode.exe`/`uv.exe` into `vendor\opencode\` and `vendor\uv\` |
-| `checksum mismatch` | A proxy or antivirus modified the download. Retry with `-RefreshTools` |
+| `checksum mismatch` | A proxy or antivirus modified the download. Retry the launcher; if it repeats, check the proxy/antivirus |
 | OpenCode starts but shows `0 MCP` | Give it a few seconds; if it stays 0, check `.runtime\logs\sessions.log` and the OpenCode log (`~/.local/share/opencode/log/opencode.log`) |
 | No `computer` tools in the session | Exit OpenCode fully, relaunch via `Computer-Use.cmd` (not `opencode` directly) |
 | `Refusing to start: no active launcher session` | Start through `Computer-Use.cmd`; that message means the server was run outside the launcher |
@@ -284,7 +263,8 @@ vendor\uv\uv.exe              <- portable uv (fetches Python/packages unless bun
 ```
 
 The vendored OpenCode binary is MIT-licensed and unmodified; version pins are the
-`-OpenCodeVersion` / `-UvVersion` defaults in `Start-ComputerUse.ps1`.
+`$script:OpenCodeVersion` / `$script:UvVersion` constants in
+`Start-ComputerUse.ps1`.
 
 ## Uninstall
 

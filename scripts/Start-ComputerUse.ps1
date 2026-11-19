@@ -27,19 +27,10 @@
 .PARAMETER SelfTest
     Check the runtime and the MCP tools without launching OpenCode.
 
-.PARAMETER RefreshTools
-    Re-download the vendored OpenCode and uv into .runtime\tools.
-
-.PARAMETER LatestTools
-    With -RefreshTools, resolve the newest upstream release instead of the pins.
-
 .PARAMETER PrepareVendor
     Copy the portable OpenCode and uv binaries into vendor\. This makes the
     toolchain portable (no npm/Node), but the first run still needs network for
     the private Python and Python packages unless a working .runtime is included.
-
-.PARAMETER OpenCodeVersion / UvVersion
-    Explicit tool versions to fetch, e.g. -OpenCodeVersion 2.3.2.
 
 .PARAMETER Directory
     Working directory for OpenCode (defaults to the current folder).
@@ -58,11 +49,7 @@ param(
     [switch]$NoAgentS,
     [switch]$Reinstall,
     [switch]$SelfTest,
-    [switch]$RefreshTools,
-    [switch]$LatestTools,
     [switch]$PrepareVendor,
-    [string]$OpenCodeVersion = "2.3.2",
-    [string]$UvVersion = "0.11.28",
     [string]$Directory,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$OpenCodeArgs
@@ -78,6 +65,10 @@ $script:VenvPy = Join-Path $script:Venv "Scripts\python.exe"
 $script:ServerScript = Join-Path $PSScriptRoot "computer_use_mcp.py"
 $script:LogDir = Join-Path $script:Runtime "logs"
 $script:AgentSRepo = "git+https://github.com/simular-ai/Agent-S.git"
+# Pinned toolchain. There is intentionally no update command; change these only
+# when you are prepared to re-test the whole stack.
+$script:OpenCodeVersion = "2.3.2"
+$script:UvVersion = "0.11.28"
 $script:LastExitCode = 0
 $script:OpenCode = $null
 $script:Uv = $null
@@ -185,22 +176,9 @@ function Get-SumForAsset {
     }
 }
 
-function Get-LatestTag {
-    param([string]$Repository, [string]$ApiUrl)
-    if ($ApiUrl) {
-        $release = Invoke-RestMethod -Uri $ApiUrl
-    } else {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/latest"
-    }
-    return ([string]$release.tag_name).TrimStart("v")
-}
-
 # --------------------------------------------------------------- opencode
 function Install-OpenCode {
-    $version = $OpenCodeVersion
-    if ($LatestTools) {
-        try { $version = Get-LatestTag -Repository "anomalyco/opencode" } catch { Write-Warn "Could not resolve the latest OpenCode; using $version." }
-    }
+    $version = $script:OpenCodeVersion
     $asset = "opencode-windows-x64.zip"
     $base = "https://github.com/anomalyco/opencode/releases/download/v$version"
 
@@ -230,8 +208,6 @@ function Install-OpenCode {
 }
 
 function Resolve-OpenCode {
-    if ($RefreshTools) { return (Install-OpenCode) }
-
     $vendor = Join-Path $script:Root "vendor\opencode\opencode.exe"
     if (Test-Path $vendor) { return $vendor }
 
@@ -250,10 +226,7 @@ function Resolve-OpenCode {
 
 # --------------------------------------------------------------- uv
 function Install-Uv {
-    $version = $UvVersion
-    if ($LatestTools) {
-        try { $version = Get-LatestTag -Repository "astral-sh/uv" } catch { Write-Warn "Could not resolve the latest uv; using $version." }
-    }
+    $version = $script:UvVersion
     $asset = "uv-x86_64-pc-windows-msvc.zip"
     $base = "https://github.com/astral-sh/uv/releases/download/$version"
 
@@ -280,10 +253,6 @@ function Install-Uv {
 }
 
 function Resolve-Uv {
-    if ($RefreshTools) {
-        try { return (Install-Uv) } catch { Write-Warn "uv download failed: $($_.Exception.Message)" }
-    }
-
     $vendor = Join-Path $script:Root "vendor\uv\uv.exe"
     if (Test-Path $vendor) { return $vendor }
 
@@ -309,7 +278,6 @@ Write-Host "  ------------------------------------------" -ForegroundColor DarkC
 if (-not (Test-Path $script:ServerScript)) {
     Fail "Missing $script:ServerScript. Keep the scripts folder next to Computer-Use.cmd."
 }
-if ($LatestTools) { $RefreshTools = $true }
 if (-not (Test-Path $script:LogDir)) {
     New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null
 }
@@ -342,10 +310,10 @@ if ($script:Uv) { Write-Step "uv:       $script:Uv" }
 if ($PrepareVendor) {
     $vendorOpenCodeFile = Join-Path $script:Root "vendor\opencode\opencode.exe"
     $vendorUvFile = Join-Path $script:Root "vendor\uv\uv.exe"
-    if ((Test-Path $vendorOpenCodeFile) -and (Test-Path $vendorUvFile) -and (-not $RefreshTools)) {
+    if ((Test-Path $vendorOpenCodeFile) -and (Test-Path $vendorUvFile)) {
         Write-Host ""
-        Write-Ok "vendor\ already contains the portable toolchain; nothing to do."
-        Write-Step "Use -RefreshTools to re-download it."
+        Write-Ok "vendor\ already contains the pinned portable toolchain; nothing to do."
+        Write-Step "Delete vendor\opencode\opencode.exe and vendor\uv\uv.exe to rebuild it."
         exit 0
     }
 
