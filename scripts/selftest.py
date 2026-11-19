@@ -14,12 +14,17 @@ Checks, in order:
 """
 
 import asyncio
+import base64
+import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+
+from PIL import Image
 
 # The self-test prints sample text with accents/emoji; a cp1252 console would
 # otherwise explode mid-test and report a false failure.
@@ -62,6 +67,13 @@ async def call(session, tool, **args):
     return text, reply
 
 
+def image_size(reply) -> tuple[int, int] | None:
+    for block in reply.content:
+        if type(block).__name__ == "ImageContent":
+            return Image.open(io.BytesIO(base64.b64decode(block.data))).size
+    return None
+
+
 async def main() -> int:
     env = {**os.environ, "COMPUTER_USE_SESSION_TOKEN": "selftest"}
     params = StdioServerParameters(
@@ -87,6 +99,44 @@ async def main() -> int:
             shot = await session.call_tool("screenshot", {"monitor": 0, "max_width": 640})
             kinds = [type(block).__name__ for block in shot.content]
             record("screenshot", "ImageContent" in kinds, str(kinds))
+
+            monitor_one = None
+            match = re.search(r"1=\((-?\d+),\s*(-?\d+),\s*(\d+),\s*(\d+)\)", info)
+            if match:
+                monitor_one = tuple(int(value) for value in match.groups())
+
+            if monitor_one:
+                mx, my, _mw, _mh = monitor_one
+                shot1 = await session.call_tool(
+                    "screenshot", {"monitor": 1, "max_width": 640}
+                )
+                text1 = " ".join(
+                    getattr(block, "text", "")
+                    for block in shot1.content
+                    if hasattr(block, "text")
+                )
+                record(
+                    "monitor 1 screenshot",
+                    image_size(shot1) is not None and "monitor 1" in text1,
+                    (text1.splitlines()[0][:90] if text1 else "no text"),
+                )
+                region = [mx + 50, my + 50, mx + 370, my + 250]
+            else:
+                record("monitor 1 screenshot", True, "only one monitor; skipped")
+                region = [100, 100, 420, 300]
+
+            # Region edges are absolute screen coordinates (not width/height).
+            # A nonzero/negative origin catches the old right/bottom mix-up.
+            region_shot = await session.call_tool(
+                "screenshot", {"region": region, "max_width": 640}
+            )
+            expected = (region[2] - region[0], region[3] - region[1])
+            actual = image_size(region_shot)
+            record(
+                "region screenshot",
+                actual == expected,
+                f"{actual} expected {expected}",
+            )
 
             # --- clipboard: unicode + emoji + newline round-trip ---------------
             payload = "line one — Lý 🐉\nline two"
@@ -147,6 +197,45 @@ async def main() -> int:
                         and "ImageContent" in snap_kinds,
                         snap_text.splitlines()[0][:80] if snap_text else "no text",
                     )
+
+                    if monitor_one:
+                        mx, my, _mw, _mh = monitor_one
+                        moved2, _ = await call(
+                            session,
+                            "window_action",
+                            title=editor_title,
+                            action="move_resize",
+                            x=mx + 120,
+                            y=my + 120,
+                            width=620,
+                            height=240,
+                        )
+                        record(
+                            "window_action on monitor 1",
+                            moved2.startswith("move_resize:")
+                            and f"({mx + 120},{my + 120}," in moved2,
+                            moved2[:100],
+                        )
+                        await call(session, "focus_window", title=editor_title)
+                        shot2 = await session.call_tool(
+                            "screenshot", {"window": editor_title, "max_width": 640}
+                        )
+                        text2 = " ".join(
+                            getattr(block, "text", "")
+                            for block in shot2.content
+                            if hasattr(block, "text")
+                        )
+                        record(
+                            "monitor 1 window screenshot",
+                            image_size(shot2) is not None and "at screen (" in text2,
+                            text2.splitlines()[0][:90] if text2 else "no text",
+                        )
+                        clicked2, _ = await call(session, "click", x=100, y=120)
+                        record(
+                            "monitor 1 click",
+                            clicked2.startswith("left click"),
+                            clicked2[:90],
+                        )
 
                     await call(session, "type_text", text=PROBE)
                     deadline = time.monotonic() + 6.0

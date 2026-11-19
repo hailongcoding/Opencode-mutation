@@ -971,7 +971,9 @@ def screenshot(
         right, bottom = min(right, vx + vw), min(bottom, vy + vh)
         if right <= left or bottom <= top:
             return ["region is empty after clamping to the visible desktop"]
-        shot = _grab((left, top, right, bottom))
+        # _grab expects (left, top, width, height); region supplies absolute
+        # right/bottom edges, so convert instead of treating them as sizes.
+        shot = _grab((left, top, right - left, bottom - top))
         screen_w, screen_h = shot.size
         origin_x, origin_y = left, top
         region = (left, top, right, bottom)
@@ -1741,15 +1743,16 @@ def wait_for_element(target: str, window: str = "", timeout: float = 10.0) -> st
 def window_action(
     title: str,
     action: str = "activate",
-    x: int = -1,
-    y: int = -1,
-    width: int = -1,
-    height: int = -1,
+    x: int | None = None,
+    y: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
 ) -> str:
     """Act on a whole window: activate|minimize|maximize|restore|move|resize|move_resize.
 
     x/y/width/height are screen pixels and only used by move/resize/move_resize;
-    -1 keeps the current value. Returns the resulting rectangle.
+    omit them to keep the current value. Negative x/y are valid: monitors can sit
+    to the left of or above the primary display. Returns the resulting rectangle.
     """
     target = _pick_window(title)
     if not target:
@@ -1767,10 +1770,12 @@ def window_action(
             return f"failed: ShowWindow({action}) returned 0"
     elif action in {"move", "resize", "move_resize"}:
         left, top, current_width, current_height = _window_rect(target["hwnd"])
-        new_x = x if x >= 0 else left
-        new_y = y if y >= 0 else top
-        new_width = width if width > 0 else current_width
-        new_height = height if height > 0 else current_height
+        # None means "keep current". Do not use -1 as the sentinel: it is a real
+        # coordinate on a monitor positioned left of or above the primary display.
+        new_x = left if x is None else int(x)
+        new_y = top if y is None else int(y)
+        new_width = current_width if width is None or width <= 0 else int(width)
+        new_height = current_height if height is None or height <= 0 else int(height)
         # SWP_NOZORDER | SWP_NOACTIVATE
         if not u.SetWindowPos(hwnd, 0, new_x, new_y, new_width, new_height, 0x0004 | 0x0010):
             return f"failed: SetWindowPos returned 0 (error {ctypes.get_last_error()})"

@@ -5,7 +5,9 @@ with a computer-use ability attached **to that session only**. Close OpenCode an
 the ability is gone — nothing is left enabled globally.
 
 No global `opencode.json` is edited, no MCP server is registered machine-wide, no
-PATH entries are added, and nothing is installed outside this folder.
+PATH entries are added, and the computer-use runtime stays inside this folder.
+OpenCode itself still writes its normal logs, auth and session data under your user
+profile, exactly as any OpenCode run does.
 
 ---
 
@@ -32,9 +34,13 @@ then act on them by id/name instead of guessing pixels.
 | `agent_s` | Optional: hands a whole task to **Agent-S** (autonomous GUI agent) |
 | `agent_status` | What is actually available in the runtime |
 
-Multi-monitor is handled: `screen_info` shows the layout, `screenshot(monitor=0|1|...|-1)`
-picks a display, and clicks are translated back to the right screen coordinates.
-`snapshot(window="Title")` and `screenshot(window="Title")` target one window.
+Multi-monitor is handled natively: `screen_info` shows the physical layout
+(`x,y,width,height`; primary first), `screenshot(monitor=0|1|...|-1)` picks a
+display, and clicks are translated back to the correct screen, including negative
+origins. `window_action` accepts negative `x/y`, so it can move a window onto a
+display left of or above the primary. `snapshot(window="Title")` and
+`screenshot(window="Title")` target one window. Verified with a 1280x720 primary
+and a 3840x2160 secondary at `(-1341,-2160)`.
 
 `agent_s` is only usable if you provide model credentials and a grounding
 endpoint (see below). Without them, the agent still drives the GUI itself via the
@@ -67,24 +73,35 @@ moving the pointer where the target app supports it.
 .\Computer-Use.cmd --prompt "Open Notepad and type hello"
 ```
 
-**Nothing needs to be installed first** — no Node, no npm, and no system Python.
-On first run the launcher uses the portable OpenCode + `uv` already in `vendor\`
-(or downloads them, ~150 MB, checksum-verified), then builds `.runtime\venv` and
-installs:
+**Nothing needs to be installed first** — no Node, no npm, no Bun, and no system
+Python. On first run the launcher uses the portable OpenCode + `uv` already in
+`vendor\` (or downloads them, ~150 MB, checksum-verified), downloads a **private
+uv-managed Python 3.12** into `.runtime\tools\python` (~21 MB), builds
+`.runtime\venv`, and installs:
 
-- `mcp` (server SDK), `pyautogui`, `pillow` — the GUI primitives
-- **Agent-S** (`gui-agents`) from <https://github.com/simular-ai/Agent-S.git>
+- `mcp` (server SDK), `pyautogui`, `pillow`, `pywinauto` — the GUI primitives
+- **Agent-S** (`gui-agents`): from
+  <https://github.com/simular-ai/Agent-S.git> when Git is present; otherwise the
+  launcher uses the official `gui-agents==0.3.2` PyPI package (same release).
 
-First run takes a few minutes (Agent-S pulls paddle/OCR/selenium deps). Later runs
-start instantly and work offline. Useful switches:
+The first run therefore needs internet for Python and packages. Later runs on the
+same PC start instantly and work offline.
+
+If you copy the **whole folder including `.runtime`**, the first launch at the new
+path detects that the venv cannot run there and rebuilds it from the bundled
+private Python and uv cache. That rebuild works offline for the 29 core tools
+(verified by moving a prepared install and running with `-Offline`); Agent-S is
+not preserved by the rebuild and may need network to reinstall. Virtual
+environments are path-specific, but `.runtime\tools\python` plus
+`.runtime\tools\uv-cache` are what make the folder portable. Useful switches:
 
 | Switch | Effect |
 | --- | --- |
 | `-NoAgentS` | Skip the heavy Agent-S install (primitives still work) |
 | `-Reinstall` | Wipe and rebuild `.runtime\venv` |
 | `-SelfTest` | Check every primitive (screenshot, clipboard, real Unicode typing into a scratch window the test owns, accessibility snapshot, element actions on a throwaway Run dialog, launch/wait, window list) without launching OpenCode |
-| `-Offline` | Never download; fail fast if something is missing |
-| `-PrepareVendor` | Copy portable OpenCode + uv into `vendor\` to make an offline bundle |
+| `-Offline` | Never download; fails unless the private Python, packages, OpenCode/uv and runtime are already present |
+| `-PrepareVendor` | Copy portable OpenCode + uv into `vendor\` (toolchain only; a first run without `.runtime` needs network for Python + packages) |
 | `-RefreshTools` | Re-download OpenCode/uv (pinned versions) |
 | `-LatestTools` | With `-RefreshTools`, use the newest upstream release |
 
@@ -94,17 +111,32 @@ start instantly and work offline. Useful switches:
 .\Computer-Use.cmd -PrepareVendor   # portable opencode.exe + uv.exe into vendor\
 ```
 
-`vendor\` removes the npm/Node requirement entirely: the folder then carries the
+`vendor\` removes the npm/Node requirement entirely: the folder carries the
 official OpenCode binary and `uv`, so `Computer-Use.cmd` runs on a PC without
 Node, npm, or a system-wide OpenCode.
 
-Python is the one piece `uv` still provides on the target: on first run the
-launcher builds `.runtime\venv`, reusing the machine's Python 3.12 if there is one
-and otherwise fetching a private copy. That build needs network access to install
-the Python packages. A `.runtime\venv` copied from another machine is detected and
-rebuilt automatically when it does not run in the new location.
+`vendor\opencode\opencode.exe` is the **official compiled binary**, not a source
+checkout. Bun is embedded in it, which is why no Bun/Node/npm install is needed.
+A source checkout would require Bun to build and would make the fresh-PC problem
+worse; the binary is the self-contained equivalent.
 
-Approximate sizes: `vendor\` ~320 MB, `.runtime\venv` ~930 MB.
+Python is the remaining first-run download: the launcher prefers a **uv-managed
+Python 3.12 inside `.runtime\tools\python`**, using a system Python only as a
+fallback. It then installs packages from PyPI.
+
+| What you copy to the target | First launch |
+| --- | --- |
+| `vendor\` only, no `.runtime` | needs network for Python and packages |
+| the whole folder, including `.runtime` | rebuilds the venv from the bundled private Python + uv cache; core tools verified offline, Agent-S may need network |
+| an existing working runtime at the same path | starts immediately, no network |
+
+A `.runtime\venv` by itself is still path-specific; the launcher detects a venv
+that cannot start and rebuilds it instead of failing. For an offline target,
+test the copied folder once with `-Offline` before relying on it.
+
+Do not commit `.runtime`, `vendor\opencode` or `vendor\uv`; they are ignored.
+
+Approximate sizes: `vendor\` ~320 MB, `.runtime\venv` ~930 MB with Agent-S.
 
 `vendor\opencode\opencode.exe` is ~250 MB, so a plain GitHub repo will reject it
 (100 MB file limit). Use Git LFS, or ship the prepared folder as a zip / release
@@ -112,6 +144,24 @@ asset instead of committing `vendor\`.
 
 Tool lookup order: `vendor\` → `.runtime\tools\` (auto-download cache) → `PATH`.
 That means an existing OpenCode/uv install is reused instead of downloading.
+
+## Updating without npm
+
+OpenCode and uv can be updated from their official GitHub Releases:
+
+```powershell
+.\Computer-Use.cmd -RefreshTools -LatestTools -PrepareVendor
+```
+
+`-RefreshTools` downloads the newest official Windows binaries, verifies the
+published SHA-256 where available, and `-PrepareVendor` copies them into
+`vendor\`. This never invokes npm, Node or Bun.
+
+The launcher's own files live at
+<https://github.com/hailongcoding/Opencode-mutation>. Update a checkout with
+`git pull`; a released ZIP plus checksum is the intended next step for PCs
+without Git. Avoid OpenCode's npm/Bun-based updater when npm is broken: use the
+`-RefreshTools` path above instead.
 
 ---
 
@@ -149,9 +199,11 @@ to get text from `screenshot(ocr=true)`. Set `TESSERACT_CMD` if it is not in
    applies to that process only and cannot leak into your other OpenCode sessions.
 4. The MCP server (`scripts\computer_use_mcp.py`) refuses to start unless that
    token is present.
-5. When OpenCode exits, the environment variables die with the process. The only
-   things written live inside this folder: `.runtime\` (venv, logs, tool cache) and,
-   if you prepared it, `vendor\`.
+5. When OpenCode exits, the environment variables die with the process. The
+   computer-use side writes only inside this folder: `.runtime\` (venv, logs, tool
+   cache) and, if prepared, `vendor\`. OpenCode still writes its own logs, auth and
+   session data under your user profile — normal OpenCode behavior, not a global
+   MCP grant.
 
 So: no global grant, no always-on listener, no background agent.
 
@@ -177,12 +229,12 @@ So: no global grant, no always-on listener, no background agent.
 
 | Symptom | Fix |
 | --- | --- |
-| First run cannot download OpenCode/uv | Corporate proxy or offline PC. Run `-PrepareVendor` on a connected machine and copy the folder, or drop `opencode.exe`/`uv.exe` into `vendor\opencode\` and `vendor\uv\` |
+| First run cannot download OpenCode/uv | Corporate proxy or offline PC. Run `-PrepareVendor` on a connected machine and copy the folder, or drop `opencode.exe`/`uv.exe` into `vendor\opencode\` and `vendor\uv\`. This covers the binaries only; copy the whole folder including `.runtime` if the target has no network at all |
 | `checksum mismatch` | A proxy or antivirus modified the download. Retry with `-RefreshTools` |
 | OpenCode starts but shows `0 MCP` | Give it a few seconds; if it stays 0, check `.runtime\logs\sessions.log` and the OpenCode log (`~/.local/share/opencode/log/opencode.log`) |
 | No `computer` tools in the session | Exit OpenCode fully, relaunch via `Computer-Use.cmd` (not `opencode` directly) |
 | `Refusing to start: no active launcher session` | Start through `Computer-Use.cmd`; that message means the server was run outside the launcher |
-| Agent-S install failed | Primitives still work. Retry `.\Computer-Use.cmd -Reinstall`, or use `-NoAgentS` |
+| Agent-S install failed | Primitives still work. The launcher falls back to the PyPI `gui-agents==0.3.2` package when Git is missing. Retry `.\Computer-Use.cmd -Reinstall`, or use `-NoAgentS` |
 | Clicks land slightly off | Screenshots are scaled; always click using coordinates from the most recent `screenshot`, and capture the monitor that holds the target window |
 | `snapshot`/`ui_tree` shows no controls | That app exposes no useful UI Automation tree (some games, some Tk/Electron builds). Use `screenshot` + `click`/`type_text` instead |
 | `snapshot`/`ui_tree` is slow or hangs | One control's accessibility provider is stalling. Retry with a smaller `max_items`, target the exact window, or use `screenshot` for that app |
@@ -206,10 +258,10 @@ scripts\Start-ComputerUse.ps1 <- bootstrap: portable tools, runtime, token, laun
 scripts\computer_use_mcp.py   <- the computer-use MCP server (29 tools)
 scripts\selftest.py           <- -SelfTest implementation
 scripts\scratch_editor.py     <- throwaway Tk window the self-test types into
-vendor\opencode\opencode.exe  <- optional offline bundle (portable OpenCode)
-vendor\uv\uv.exe              <- optional offline bundle (portable uv)
-.runtime\tools                <- auto-downloaded OpenCode/uv cache
-.runtime\venv                 <- private Python runtime (Agent-S lives here)
+vendor\opencode\opencode.exe  <- portable OpenCode (compiled binary, embedded Bun)
+vendor\uv\uv.exe              <- portable uv (fetches Python/packages unless bundled)
+.runtime\tools                <- private Python + downloaded tool/uv cache
+.runtime\venv                 <- isolated venv (Agent-S lives here)
 .runtime\logs                 <- session + Agent-S logs
 ```
 

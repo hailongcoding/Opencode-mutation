@@ -10,7 +10,7 @@
       1. Finds OpenCode (vendor\ -> .runtime\tools\ -> PATH) or downloads the
          official Windows binary once.
       2. Finds uv the same way, then uses it to build .runtime\venv and install
-         Agent-S (gui-agents) from GitHub.
+         Agent-S (gui-agents) from Git, with a PyPI fallback when Git is absent.
       3. Starts the local computer-use MCP server as a child of OpenCode and
          injects it through OPENCODE_CONFIG_CONTENT for this process only.
 
@@ -28,7 +28,8 @@
     Check the runtime and the MCP tools without launching OpenCode.
 
 .PARAMETER Offline
-    Never download anything. Fails fast if OpenCode/uv are missing.
+    Never download anything. Fails fast if OpenCode/uv, the private Python, or
+    any required Python package is missing.
 
 .PARAMETER RefreshTools
     Re-download the vendored OpenCode and uv into .runtime\tools.
@@ -37,8 +38,9 @@
     With -RefreshTools, resolve the newest upstream release instead of the pins.
 
 .PARAMETER PrepareVendor
-    Copy the portable OpenCode and uv binaries into vendor\ so this folder can be
-    zipped and used on machines with no network, no npm and no Node.
+    Copy the portable OpenCode and uv binaries into vendor\. This makes the
+    toolchain portable (no npm/Node), but the first run still needs network for
+    the private Python and Python packages unless a working .runtime is included.
 
 .PARAMETER OpenCodeVersion / UvVersion
     Explicit tool versions to fetch, e.g. -OpenCodeVersion 2.3.2.
@@ -74,6 +76,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Make -Offline mean real offline: no Python downloads and no package-index access.
+if ($Offline) {
+    $env:UV_PYTHON_DOWNLOADS = "never"
+    $env:UV_OFFLINE = "1"
+}
 
 $script:Root = Split-Path -Parent $PSScriptRoot
 $script:Runtime = Join-Path $script:Root ".runtime"
@@ -202,6 +210,7 @@ function Get-LatestTag {
 
 # --------------------------------------------------------------- opencode
 function Install-OpenCode {
+    if ($Offline) { throw "Offline mode: refusing to download OpenCode." }
     $version = $OpenCodeVersion
     if ($LatestTools) {
         try { $version = Get-LatestTag -Repository "anomalyco/opencode" } catch { Write-Warn "Could not resolve the latest OpenCode; using $version." }
@@ -258,6 +267,7 @@ function Resolve-OpenCode {
 
 # --------------------------------------------------------------- uv
 function Install-Uv {
+    if ($Offline) { throw "Offline mode: refusing to download uv." }
     $version = $UvVersion
     if ($LatestTools) {
         try { $version = Get-LatestTag -Repository "astral-sh/uv" } catch { Write-Warn "Could not resolve the latest uv; using $version." }
@@ -318,6 +328,9 @@ Write-Host "  ------------------------------------------" -ForegroundColor DarkC
 if (-not (Test-Path $script:ServerScript)) {
     Fail "Missing $script:ServerScript. Keep the scripts folder next to Computer-Use.cmd."
 }
+if ($Offline -and ($RefreshTools -or $LatestTools)) {
+    Fail "-Offline cannot be combined with -RefreshTools or -LatestTools."
+}
 if ($LatestTools) { $RefreshTools = $true }
 if (-not (Test-Path $script:LogDir)) {
     New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null
@@ -359,7 +372,7 @@ if ($PrepareVendor) {
     }
 
     Write-Host ""
-    Write-Step "Preparing an offline bundle in vendor\ (portable, no npm/Node needed)..."
+    Write-Step "Preparing the portable toolchain in vendor\ (no npm/Node needed)..."
     try {
         $cachedOpenCode = Join-Path $script:Tools "opencode\opencode.exe"
         if (-not (Test-Path $cachedOpenCode)) { $null = Install-OpenCode }
@@ -377,8 +390,10 @@ if ($PrepareVendor) {
     }
     $bundleSize = [math]::Round((Get-ChildItem (Join-Path $script:Root "vendor") -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
     Write-Host ""
-    Write-Ok "vendor\ is ready ($bundleSize MB). Zip this whole folder; on another PC just run Computer-Use.cmd."
-    Write-Step "Note: .runtime\venv is still built on first run (needs uv only, which is bundled)."
+    Write-Ok "vendor\ toolchain is ready ($bundleSize MB)."
+    Write-Step "On another PC with no .runtime, the first run needs network for the private Python and packages."
+    Write-Step "If you also copy .runtime, the venv is rebuilt from the bundled Python/uv cache and can run offline."
+    Write-Step "That rebuild restores the core tools; Agent-S may need network to reinstall."
     exit 0
 }
 
@@ -391,7 +406,13 @@ if ($Reinstall -and (Test-Path $script:Venv)) {
 function New-Runtime {
     Write-Step "Creating isolated Python runtime at .runtime\venv"
     if ($script:Uv) {
-        Invoke-External { & $script:Uv venv --python 3.12 --relocatable $script:Venv }
+        # Prefer a uv-managed Python installed under .runtime\tools\python, so
+        # the runtime does not depend on a machine-wide Python installation.
+        # Fall back to a system Python when managed Python is unavailable.
+        Invoke-External { & $script:Uv venv --python 3.12 --relocatable --managed-python $script:Venv }
+        if ($script:LastExitCode -ne 0) {
+            Invoke-External { & $script:Uv venv --python 3.12 --relocatable $script:Venv }
+        }
         if ($script:LastExitCode -ne 0) {
             Invoke-External { & $script:Uv venv --python 3.12 $script:Venv }
         }
@@ -402,6 +423,9 @@ function New-Runtime {
         Invoke-External { & $script:Py -m venv $script:Venv }
     }
     if (-not (Test-Path $script:VenvPy)) {
+        if ($Offline) {
+            Fail "Offline mode: could not create .runtime\venv. Copy a prepared .runtime (including tools\python), or run once with network access."
+        }
         Fail "Could not create the virtual environment."
     }
 }
@@ -410,15 +434,21 @@ function Install-Packages {
     param([string[]]$Packages, [string]$Label)
     Write-Step $Label
     if ($script:Uv) {
-        Invoke-External { & $script:Uv pip install --python $script:VenvPy @Packages }
+        $uvArgs = @("pip", "install", "--python", $script:VenvPy)
+        if ($Offline) { $uvArgs += "--offline" }
+        $uvArgs += $Packages
+        Invoke-External { & $script:Uv @uvArgs }
     } else {
-        Invoke-External { & $script:VenvPy -m pip install --disable-pip-version-check @Packages }
+        $pipArgs = @("-m", "pip", "install", "--disable-pip-version-check")
+        if ($Offline) { $pipArgs += "--no-index" }
+        $pipArgs += $Packages
+        Invoke-External { & $script:VenvPy @pipArgs }
     }
     if ($script:LastExitCode -ne 0) { throw "Install failed: $($Packages -join ' ')" }
 }
 
 function Test-Runtime {
-    Invoke-External { & $script:VenvPy -c "import mcp.server.fastmcp, pyautogui, PIL" 2>$null }
+    Invoke-External { & $script:VenvPy -c "import mcp.server.fastmcp, pyautogui, PIL, pywinauto" 2>$null }
     return ($script:LastExitCode -eq 0)
 }
 
@@ -434,28 +464,50 @@ if (-not $runtimeUsable) {
         Remove-Item -Recurse -Force $script:Venv
     }
     New-Runtime
-    Install-Packages -Packages @("mcp>=1.10,<2", "pyautogui", "pillow") -Label "Installing MCP server dependencies..."
+    Install-Packages -Packages @("mcp>=1.10,<2", "pyautogui", "pillow", "pywinauto") -Label "Installing MCP server dependencies..."
     if (-not (Test-Runtime)) {
-        Fail "The isolated runtime cannot import mcp/pyautogui/Pillow."
+        Fail "The isolated runtime cannot import mcp/pyautogui/Pillow/pywinauto."
     }
 } elseif (-not (Test-Runtime)) {
     Write-Warn "Runtime is incomplete; repairing base dependencies."
-    Install-Packages -Packages @("mcp>=1.10,<2", "pyautogui", "pillow") -Label "Repairing MCP server dependencies..."
+    Install-Packages -Packages @("mcp>=1.10,<2", "pyautogui", "pillow", "pywinauto") -Label "Repairing MCP server dependencies..."
     if (-not (Test-Runtime)) {
-        Fail "The isolated runtime cannot import mcp/pyautogui/Pillow."
+        Fail "The isolated runtime cannot import mcp/pyautogui/Pillow/pywinauto."
     }
 }
 
 $script:AgentS = Join-Path $script:Venv "Scripts\agent_s.exe"
 if (-not $NoAgentS) {
     if (-not (Test-Path $script:AgentS)) {
-        Write-Step "Installing Agent-S (gui-agents) from $script:AgentSRepo"
-        Write-Step "First run only - this pulls paddle/ocr/selenium dependencies and can take a few minutes."
-        try {
-            Install-Packages -Packages @($script:AgentSRepo) -Label "Installing Agent-S..."
-        } catch {
-            Write-Warn "Agent-S install failed: $($_.Exception.Message)"
-            Write-Warn "GUI primitives still work. Retry later with -Reinstall, or run with -NoAgentS to skip."
+        $installed = $false
+        $git = Get-Command git -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($git) {
+            Write-Step "Installing Agent-S (gui-agents) from $script:AgentSRepo"
+            Write-Step "First run only - this pulls paddle/ocr/selenium dependencies and can take a few minutes."
+            try {
+                Install-Packages -Packages @($script:AgentSRepo) -Label "Installing Agent-S..."
+                $installed = Test-Path $script:AgentS
+            } catch {
+                Write-Warn "Agent-S git install failed: $($_.Exception.Message)"
+            }
+        } else {
+            Write-Step "Git was not found; installing the official gui-agents package from PyPI instead."
+        }
+
+        # A fresh PC may not have Git. The official PyPI package is the same
+        # Agent-S release (gui-agents 0.3.2) and avoids a Git dependency.
+        if (-not $installed) {
+            try {
+                Install-Packages -Packages @("gui-agents==0.3.2") -Label "Installing Agent-S from PyPI..."
+                $installed = Test-Path $script:AgentS
+            } catch {
+                Write-Warn "Agent-S PyPI install failed: $($_.Exception.Message)"
+            }
+        }
+
+        if (-not $installed) {
+            Write-Warn "Agent-S was not installed. GUI primitives still work."
+            Write-Warn "Retry with network access, or run with -NoAgentS to skip this step."
         }
     } else {
         Write-Step "Agent-S already present in the runtime."
