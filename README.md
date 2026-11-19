@@ -87,13 +87,16 @@ uv-managed Python 3.12** into `.runtime\tools\python` (~21 MB), builds
 The first run therefore needs internet for Python and packages. Later runs on the
 same PC start instantly and work offline.
 
-If you copy the **whole folder including `.runtime`**, the first launch at the new
-path detects that the venv cannot run there and rebuilds it from the bundled
-private Python and uv cache. That rebuild works offline for the 29 core tools
+If you copy the **whole folder including `.runtime`, with `tools\python` and
+`tools\uv-cache` present** (a normal first run by this launcher creates them), the
+first launch at the new path detects that the venv cannot run there and rebuilds it
+from those bundled pieces. That rebuild works offline for the 29 core tools
 (verified by moving a prepared install and running with `-Offline`); Agent-S is
 not preserved by the rebuild and may need network to reinstall. Virtual
 environments are path-specific, but `.runtime\tools\python` plus
-`.runtime\tools\uv-cache` are what make the folder portable. Useful switches:
+`.runtime\tools\uv-cache` are what make the folder portable. A runtime built before
+this behavior existed may lack those directories and needs one online run. Useful
+switches:
 
 | Switch | Effect |
 | --- | --- |
@@ -127,7 +130,7 @@ fallback. It then installs packages from PyPI.
 | What you copy to the target | First launch |
 | --- | --- |
 | `vendor\` only, no `.runtime` | needs network for Python and packages |
-| the whole folder, including `.runtime` | rebuilds the venv from the bundled private Python + uv cache; core tools verified offline, Agent-S may need network |
+| the whole folder, with `.runtime\tools\python` + `.runtime\tools\uv-cache` present | rebuilds the venv from those bundled pieces; core tools verified offline, Agent-S may need network |
 | an existing working runtime at the same path | starts immediately, no network |
 
 A `.runtime\venv` by itself is still path-specific; the launcher detects a venv
