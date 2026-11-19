@@ -84,27 +84,23 @@ uv-managed Python 3.12** into `.runtime\tools\python` (~21 MB), builds
   <https://github.com/simular-ai/Agent-S.git> when Git is present; otherwise the
   launcher uses the official `gui-agents==0.3.2` PyPI package (same release).
 
-The first run therefore needs internet for Python and packages. Later runs on the
-same PC start instantly and work offline.
+The first run therefore needs internet for Python and packages, and OpenCode needs
+internet for models anyway. Later runs reuse the runtime and start quickly.
 
 If you copy the **whole folder including `.runtime`, with `tools\python` and
 `tools\uv-cache` present** (a normal first run by this launcher creates them), the
 first launch at the new path detects that the venv cannot run there and rebuilds it
-from those bundled pieces. That rebuild works offline for the 29 core tools
-(verified by moving a prepared install and running with `-Offline`); Agent-S is
-not preserved by the rebuild and may need network to reinstall. Virtual
-environments are path-specific, but `.runtime\tools\python` plus
-`.runtime\tools\uv-cache` are what make the folder portable. A runtime built before
-this behavior existed may lack those directories and needs one online run. Useful
-switches:
+from those bundled pieces instead of downloading Python and packages again. Agent-S
+is not preserved by the rebuild and may need reinstalling. Virtual environments are
+path-specific; `.runtime\tools\python` plus `.runtime\tools\uv-cache` are what make
+a copied folder cheap to rebuild. Useful switches:
 
 | Switch | Effect |
 | --- | --- |
 | `-NoAgentS` | Skip the heavy Agent-S install (primitives still work) |
 | `-Reinstall` | Wipe and rebuild `.runtime\venv` |
 | `-SelfTest` | Check every primitive (screenshot, clipboard, real Unicode typing into a scratch window the test owns, accessibility snapshot, element actions on a throwaway Run dialog, launch/wait, window list) without launching OpenCode |
-| `-Offline` | Never download; fails unless the private Python, packages, OpenCode/uv and runtime are already present |
-| `-PrepareVendor` | Copy portable OpenCode + uv into `vendor\` (toolchain only; a first run without `.runtime` needs network for Python + packages) |
+| `-PrepareVendor` | Copy portable OpenCode + uv into `vendor\` (toolchain only; Python and packages are still downloaded on first run) |
 | `-RefreshTools` | Re-download OpenCode/uv (pinned versions) |
 | `-LatestTools` | With `-RefreshTools`, use the newest upstream release |
 
@@ -127,15 +123,11 @@ Python is the remaining first-run download: the launcher prefers a **uv-managed
 Python 3.12 inside `.runtime\tools\python`**, using a system Python only as a
 fallback. It then installs packages from PyPI.
 
-| What you copy to the target | First launch |
-| --- | --- |
-| `vendor\` only, no `.runtime` | needs network for Python and packages |
-| the whole folder, with `.runtime\tools\python` + `.runtime\tools\uv-cache` present | rebuilds the venv from those bundled pieces; core tools verified offline, Agent-S may need network |
-| an existing working runtime at the same path | starts immediately, no network |
-
-A `.runtime\venv` by itself is still path-specific; the launcher detects a venv
-that cannot start and rebuilds it instead of failing. For an offline target,
-test the copied folder once with `-Offline` before relying on it.
+A `.runtime\venv` by itself is path-specific. When the folder is copied, the
+launcher detects a venv that cannot start and rebuilds it. If
+`.runtime\tools\python` and the uv cache came along, the rebuild reuses them;
+otherwise it downloads Python and packages again. Agent-S may need reinstalling
+after a rebuild.
 
 Do not commit `.runtime`, `vendor\opencode` or `vendor\uv`; they are ignored.
 
@@ -148,23 +140,46 @@ asset instead of committing `vendor\`.
 Tool lookup order: `vendor\` → `.runtime\tools\` (auto-download cache) → `PATH`.
 That means an existing OpenCode/uv install is reused instead of downloading.
 
-## Updating without npm
+## Updating: pinned by default
 
-OpenCode and uv can be updated from their official GitHub Releases:
+The defaults are pinned to a known-good set: **OpenCode 2.3.2**, **uv 0.11.28**,
+**Python 3.12**, and Agent-S 0.3.2 when installed from PyPI (a Git install uses
+the repo's `main`). There is no automatic updater, deliberately: the OpenCode
+binary, this MCP server, and Agent-S were tested together. An update is a change
+to the whole product, not a background chore.
+
+OpenCode and uv are official standalone Windows binaries. Updating them from
+GitHub Releases is a supported path, not an npm workaround:
 
 ```powershell
 .\Computer-Use.cmd -RefreshTools -LatestTools -PrepareVendor
 ```
 
-`-RefreshTools` downloads the newest official Windows binaries, verifies the
-published SHA-256 where available, and `-PrepareVendor` copies them into
-`vendor\`. This never invokes npm, Node or Bun.
+`-RefreshTools` downloads the newest official release, verifies the published
+SHA-256 where available, and `-PrepareVendor` copies it into `vendor\`. This never
+invokes npm, Node or Bun. OpenCode's own `opencode upgrade` also has a standalone
+method, but using the launcher keeps the version, location and checksum under its
+control.
+
+After any update:
+
+1. Run `.\Computer-Use.cmd -SelfTest`.
+2. Launch one session and confirm the `computer` tool group loads; the launcher
+   logs MCP startup in `.runtime\logs\sessions.log`.
+3. If anything regresses, restore the pins with
+   `.\Computer-Use.cmd -RefreshTools -PrepareVendor` (no `-LatestTools`).
+
+Python stays on 3.12 because Agent-S requires `<=3.12`; moving to 3.13/3.14 is not
+a performance win and can break the OCR/grounding stack. uv is only the installer,
+so a newer uv does not make the runtime faster. The practical policy is therefore:
+**freeze the stack, update OpenCode intentionally**, and only when a feature or fix
+is worth re-testing. If you want maximum reproducibility, Agent-S should be pinned
+to a tag/commit too, since Git `main` moves.
 
 The launcher's own files live at
 <https://github.com/hailongcoding/Opencode-mutation>. Update a checkout with
 `git pull`; a released ZIP plus checksum is the intended next step for PCs
-without Git. Avoid OpenCode's npm/Bun-based updater when npm is broken: use the
-`-RefreshTools` path above instead.
+without Git.
 
 ---
 
@@ -232,7 +247,7 @@ So: no global grant, no always-on listener, no background agent.
 
 | Symptom | Fix |
 | --- | --- |
-| First run cannot download OpenCode/uv | Corporate proxy or offline PC. Run `-PrepareVendor` on a connected machine and copy the folder, or drop `opencode.exe`/`uv.exe` into `vendor\opencode\` and `vendor\uv\`. This covers the binaries only; copy the whole folder including `.runtime` if the target has no network at all |
+| First run cannot download OpenCode/uv | Corporate proxy or restricted network. Run `-PrepareVendor` on a connected machine and copy the folder, or drop `opencode.exe`/`uv.exe` into `vendor\opencode\` and `vendor\uv\` |
 | `checksum mismatch` | A proxy or antivirus modified the download. Retry with `-RefreshTools` |
 | OpenCode starts but shows `0 MCP` | Give it a few seconds; if it stays 0, check `.runtime\logs\sessions.log` and the OpenCode log (`~/.local/share/opencode/log/opencode.log`) |
 | No `computer` tools in the session | Exit OpenCode fully, relaunch via `Computer-Use.cmd` (not `opencode` directly) |

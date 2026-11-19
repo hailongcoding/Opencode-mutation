@@ -27,10 +27,6 @@
 .PARAMETER SelfTest
     Check the runtime and the MCP tools without launching OpenCode.
 
-.PARAMETER Offline
-    Never download anything. Fails fast if OpenCode/uv, the private Python, or
-    any required Python package is missing.
-
 .PARAMETER RefreshTools
     Re-download the vendored OpenCode and uv into .runtime\tools.
 
@@ -56,15 +52,12 @@
     .\Computer-Use.cmd --prompt "Open notepad and type hello"
 .EXAMPLE
     .\Computer-Use.cmd -SelfTest
-.EXAMPLE
-    .\Computer-Use.cmd -Offline
 #>
 [CmdletBinding()]
 param(
     [switch]$NoAgentS,
     [switch]$Reinstall,
     [switch]$SelfTest,
-    [switch]$Offline,
     [switch]$RefreshTools,
     [switch]$LatestTools,
     [switch]$PrepareVendor,
@@ -76,12 +69,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
-# Make -Offline mean real offline: no Python downloads and no package-index access.
-if ($Offline) {
-    $env:UV_PYTHON_DOWNLOADS = "never"
-    $env:UV_OFFLINE = "1"
-}
 
 $script:Root = Split-Path -Parent $PSScriptRoot
 $script:Runtime = Join-Path $script:Root ".runtime"
@@ -210,7 +197,6 @@ function Get-LatestTag {
 
 # --------------------------------------------------------------- opencode
 function Install-OpenCode {
-    if ($Offline) { throw "Offline mode: refusing to download OpenCode." }
     $version = $OpenCodeVersion
     if ($LatestTools) {
         try { $version = Get-LatestTag -Repository "anomalyco/opencode" } catch { Write-Warn "Could not resolve the latest OpenCode; using $version." }
@@ -255,9 +241,6 @@ function Resolve-OpenCode {
     $onPath = Get-Command opencode -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($onPath) { return $onPath.Source }
 
-    if ($Offline) {
-        Fail "OpenCode not found and -Offline was given.`n  Put opencode.exe in vendor\opencode\ or run once with network access."
-    }
     try {
         return (Install-OpenCode)
     } catch {
@@ -267,7 +250,6 @@ function Resolve-OpenCode {
 
 # --------------------------------------------------------------- uv
 function Install-Uv {
-    if ($Offline) { throw "Offline mode: refusing to download uv." }
     $version = $UvVersion
     if ($LatestTools) {
         try { $version = Get-LatestTag -Repository "astral-sh/uv" } catch { Write-Warn "Could not resolve the latest uv; using $version." }
@@ -311,7 +293,6 @@ function Resolve-Uv {
     $onPath = Get-Command uv -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($onPath) { return $onPath.Source }
 
-    if ($Offline) { return $null }
     try {
         return (Install-Uv)
     } catch {
@@ -327,9 +308,6 @@ Write-Host "  ------------------------------------------" -ForegroundColor DarkC
 
 if (-not (Test-Path $script:ServerScript)) {
     Fail "Missing $script:ServerScript. Keep the scripts folder next to Computer-Use.cmd."
-}
-if ($Offline -and ($RefreshTools -or $LatestTools)) {
-    Fail "-Offline cannot be combined with -RefreshTools or -LatestTools."
 }
 if ($LatestTools) { $RefreshTools = $true }
 if (-not (Test-Path $script:LogDir)) {
@@ -360,7 +338,7 @@ if ($script:OpenCode -like "*\vendor\opencode\opencode.exe" -or $script:OpenCode
 Write-Step "OpenCode: $opencodeLabel"
 if ($script:Uv) { Write-Step "uv:       $script:Uv" }
 
-# --------------------------------------------------------- offline bundle
+# --------------------------------------------------------- portable toolchain
 if ($PrepareVendor) {
     $vendorOpenCodeFile = Join-Path $script:Root "vendor\opencode\opencode.exe"
     $vendorUvFile = Join-Path $script:Root "vendor\uv\uv.exe"
@@ -386,14 +364,14 @@ if ($PrepareVendor) {
         New-Item -ItemType Directory -Force -Path $vendorUv | Out-Null
         Copy-Item $cachedUv (Join-Path $vendorUv "uv.exe") -Force
     } catch {
-        Fail "Could not prepare the offline bundle: $($_.Exception.Message)"
+        Fail "Could not prepare the portable toolchain: $($_.Exception.Message)"
     }
     $bundleSize = [math]::Round((Get-ChildItem (Join-Path $script:Root "vendor") -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
     Write-Host ""
     Write-Ok "vendor\ toolchain is ready ($bundleSize MB)."
-    Write-Step "On another PC with no .runtime, the first run needs network for the private Python and packages."
-    Write-Step "If you also copy .runtime, the venv is rebuilt from the bundled Python/uv cache and can run offline."
-    Write-Step "That rebuild restores the core tools; Agent-S may need network to reinstall."
+    Write-Step "On another PC the first run still downloads Python and packages (OpenCode needs internet anyway)."
+    Write-Step "If you also copy .runtime, its bundled Python/uv cache lets the venv rebuild without re-downloading."
+    Write-Step "That rebuild restores the core tools; Agent-S may need to be reinstalled."
     exit 0
 }
 
@@ -423,10 +401,7 @@ function New-Runtime {
         Invoke-External { & $script:Py -m venv $script:Venv }
     }
     if (-not (Test-Path $script:VenvPy)) {
-        if ($Offline) {
-            Fail "Offline mode: could not create .runtime\venv. Copy a prepared .runtime (including tools\python), or run once with network access."
-        }
-        Fail "Could not create the virtual environment."
+        Fail "Could not create the virtual environment. Check the network connection."
     }
 }
 
@@ -434,15 +409,9 @@ function Install-Packages {
     param([string[]]$Packages, [string]$Label)
     Write-Step $Label
     if ($script:Uv) {
-        $uvArgs = @("pip", "install", "--python", $script:VenvPy)
-        if ($Offline) { $uvArgs += "--offline" }
-        $uvArgs += $Packages
-        Invoke-External { & $script:Uv @uvArgs }
+        Invoke-External { & $script:Uv pip install --python $script:VenvPy @Packages }
     } else {
-        $pipArgs = @("-m", "pip", "install", "--disable-pip-version-check")
-        if ($Offline) { $pipArgs += "--no-index" }
-        $pipArgs += $Packages
-        Invoke-External { & $script:VenvPy @pipArgs }
+        Invoke-External { & $script:VenvPy -m pip install --disable-pip-version-check @Packages }
     }
     if ($script:LastExitCode -ne 0) { throw "Install failed: $($Packages -join ' ')" }
 }
