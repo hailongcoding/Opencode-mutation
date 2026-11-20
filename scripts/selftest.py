@@ -8,9 +8,10 @@ Checks, in order:
   * accessibility snapshot returns a tree plus an image
   * type_text really delivers Unicode into a scratch editor window (SendInput bug)
   * element invoke + window minimize/restore work on that scratch window
-  * element set/read/click/wait work on the throwaway Run dialog (no document,
-    no save prompt, Escape discards everything)
+  * find_elements, modifier clicks, targeted scroll, element drag and wait states
+    work on the throwaway Run dialog (no document, no save prompt, Escape cancels)
   * press_keys, focus_window and close_window work, leaving no test window behind
+  * a read-only server process allows inspection and blocks every action
 """
 
 import asyncio
@@ -42,12 +43,12 @@ ROOT = os.path.dirname(HERE)
 SERVER = os.path.join(HERE, "computer_use_mcp.py")
 
 EXPECTED_TOOLS = {
-    "screenshot", "screen_info", "click", "move", "drag", "scroll",
+    "screenshot", "screen_info", "click", "move", "drag", "drag_element", "scroll",
     "type_text", "press_keys", "key_down", "key_up", "hold_key", "mouse_button",
     "clipboard", "list_windows", "focus_window", "close_window", "launch", "wait",
-    "ui_tree", "snapshot", "click_element", "invoke_element", "set_element_text",
-    "read_element", "wait_for_window", "wait_for_element", "window_action",
-    "runtime_status",
+    "ui_tree", "snapshot", "find_elements", "click_element", "invoke_element",
+    "set_element_text", "read_element", "wait_for_window", "wait_for_element",
+    "window_action", "runtime_status",
 }
 
 PROBE = "selftest 123 — Lý Thái Tổ"
@@ -76,6 +77,7 @@ def image_size(reply) -> tuple[int, int] | None:
 
 async def main() -> int:
     env = {**os.environ, "COMPUTER_USE_SESSION_TOKEN": "selftest"}
+    env["COMPUTER_USE_READ_ONLY"] = "0"
     params = StdioServerParameters(
         command=sys.executable, args=[SERVER], env=env, cwd=ROOT
     )
@@ -230,10 +232,12 @@ async def main() -> int:
                             image_size(shot2) is not None and "at screen (" in text2,
                             text2.splitlines()[0][:90] if text2 else "no text",
                         )
-                        clicked2, _ = await call(session, "click", x=100, y=120)
+                        clicked2, _ = await call(
+                            session, "click", x=100, y=120, modifiers="ctrl"
+                        )
                         record(
-                            "monitor 1 click",
-                            clicked2.startswith("left click"),
+                            "modifier click",
+                            "ctrl+left click" in clicked2,
                             clicked2[:90],
                         )
 
@@ -361,6 +365,67 @@ async def main() -> int:
                     )
                     record("wait_for_element", found.startswith("found"), found[:90])
 
+                    matches, _ = await call(
+                        session, "find_elements", query="Cancel", window="Run"
+                    )
+                    record(
+                        "find_elements",
+                        "match(es)" in matches and "Cancel" in matches and "Button" in matches,
+                        matches.splitlines()[-1][:90] if matches else "no text",
+                    )
+
+                    enabled, _ = await call(
+                        session,
+                        "wait_for_element",
+                        target="Cancel",
+                        window="Run",
+                        timeout=3,
+                        state="enabled",
+                    )
+                    record(
+                        "wait_for_element (enabled)",
+                        enabled.startswith("enabled after"),
+                        enabled[:90],
+                    )
+
+                    scrolled_to, _ = await call(
+                        session, "scroll", amount=1, target="Open:", window="Run"
+                    )
+                    record(
+                        "scroll (target)",
+                        scrolled_to.startswith("scrolled")
+                        and "Open:" in scrolled_to,
+                        scrolled_to[:90],
+                    )
+
+                    dragged, _ = await call(
+                        session,
+                        "drag_element",
+                        source="Cancel",
+                        destination="Open:",
+                        window="Run",
+                    )
+                    record(
+                        "drag_element",
+                        dragged.startswith("dragged")
+                        and "Cancel" in dragged
+                        and "Open:" in dragged,
+                        dragged[:90],
+                    )
+
+                    mod_clicked, _ = await call(
+                        session,
+                        "click_element",
+                        target="Open:",
+                        window="Run",
+                        modifiers="ctrl",
+                    )
+                    record(
+                        "click_element (modifier)",
+                        mod_clicked.startswith("ctrl+clicked"),
+                        mod_clicked[:90],
+                    )
+
                     typed, _ = await call(
                         session,
                         "set_element_text",
@@ -380,14 +445,28 @@ async def main() -> int:
                     )
                     record("click_element", clicked.startswith("clicked"), clicked[:90])
 
-                    for _ in range(12):
-                        await asyncio.sleep(0.25)
-                        windows, _ = await call(session, "list_windows")
-                        run_open = any(
-                            line.rstrip().endswith("Run") for line in windows.splitlines()
-                        )
-                        if not run_open:
-                            break
+                    closed_wait, _ = await call(
+                        session, "wait_for_window", title="Run", timeout=6, state="close"
+                    )
+                    run_open = not (
+                        closed_wait.startswith("closed after")
+                        or closed_wait.startswith("already closed")
+                    )
+                    record("wait_for_window (close)", not run_open, closed_wait[:90])
+
+                    gone, _ = await call(
+                        session,
+                        "wait_for_element",
+                        target="Cancel",
+                        window="Run",
+                        timeout=3,
+                        state="close",
+                    )
+                    record(
+                        "wait_for_element (close)",
+                        gone.startswith("closed after") or gone.startswith("already absent"),
+                        gone[:90],
+                    )
                     record(
                         "run dialog closed",
                         not run_open,
@@ -432,6 +511,57 @@ async def main() -> int:
                     os.remove(scratch2)
                 except OSError:
                     pass
+
+    # --- read-only policy: a second server process, same runtime -----------
+    ro_env = {
+        **os.environ,
+        "COMPUTER_USE_SESSION_TOKEN": "selftest-ro",
+        "COMPUTER_USE_READ_ONLY": "1",
+    }
+    ro_params = StdioServerParameters(
+        command=sys.executable, args=[SERVER], env=ro_env, cwd=ROOT
+    )
+    async with stdio_client(ro_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            status, _ = await call(session, "runtime_status")
+            record("read-only status", '"read_only": true' in status)
+
+            allowed, _ = await call(
+                session, "find_elements", query="anything", window="__missing_window__"
+            )
+            record(
+                "read-only inspection allowed",
+                not allowed.startswith("BLOCKED")
+                and allowed.startswith("find_elements:"),
+                allowed[:90],
+            )
+
+            clipboard_get, _ = await call(session, "clipboard", action="get")
+            record(
+                "read-only clipboard get",
+                clipboard_get.startswith("clipboard ("),
+                clipboard_get.splitlines()[0][:90] if clipboard_get else "no text",
+            )
+
+            blocked_set, _ = await call(
+                session, "clipboard", action="set", text="must-not-write"
+            )
+            record("read-only clipboard set blocked", blocked_set.startswith("BLOCKED"))
+            blocked_click, _ = await call(session, "click", x=1, y=1)
+            record("read-only click blocked", blocked_click.startswith("BLOCKED"))
+            blocked_drag, _ = await call(
+                session, "drag_element", source="a", destination="b"
+            )
+            record("read-only drag blocked", blocked_drag.startswith("BLOCKED"))
+            blocked_keys, _ = await call(session, "press_keys", keys="enter")
+            record("read-only keyboard blocked", blocked_keys.startswith("BLOCKED"))
+            blocked_window, _ = await call(
+                session, "close_window", title="__missing_window__"
+            )
+            record("read-only window action blocked", blocked_window.startswith("BLOCKED"))
+            blocked_launch, _ = await call(session, "launch", target="cmd.exe")
+            record("read-only launch blocked", blocked_launch.startswith("BLOCKED"))
 
     failed = [name for name, ok, _ in results if not ok]
     print("\nSELFTEST:", "OK" if not failed else f"FAILED ({', '.join(failed)})")

@@ -29,6 +29,7 @@ from ctypes import wintypes
 
 SESSION_ENV = "COMPUTER_USE_SESSION_TOKEN"
 PARENT_ENV = "COMPUTER_USE_PARENT_PID"
+READ_ONLY_ENV = "COMPUTER_USE_READ_ONLY"
 
 if not os.environ.get(SESSION_ENV):
     sys.stderr.write(
@@ -113,6 +114,32 @@ ROOT = os.path.dirname(HERE)
 _shot: dict | None = None
 
 
+def _read_only() -> bool:
+    """Whether this process was launched as inspection-only."""
+    return os.environ.get(READ_ONLY_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+# These tools cannot change the desktop (clipboard still checks its action).
+_READ_ONLY_TOOLS = frozenset(
+    {
+        "screenshot", "screen_info", "ui_tree", "snapshot", "find_elements",
+        "read_element", "list_windows", "wait_for_window", "wait_for_element",
+        "wait", "clipboard", "runtime_status",
+    }
+)
+
+
+def _read_only_block() -> str:
+    return (
+        "BLOCKED: this Computer-Use session is read-only. Inspection tools "
+        "(snapshot, ui_tree, screenshot, find_elements, read_element, "
+        "list_windows, waits, runtime_status, clipboard get) are available, "
+        "but every mouse, keyboard, window and launch action is disabled."
+    )
+
+
 def _safe(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -122,6 +149,8 @@ def _safe(fn):
                 "DETACHED: the Computer-Use launcher that created this session is no longer running. "
                 "Start Computer-Use.cmd again for a new session."
             )
+        if _read_only() and fn.__name__ not in _READ_ONLY_TOOLS:
+            return _read_only_block()
         try:
             return fn(*args, **kwargs)
         except pyautogui.FailSafeException:
@@ -331,6 +360,9 @@ _KEY_ALIASES = {
     "windows": "winleft",
     "cmd": "winleft",
     "super": "winleft",
+    "meta": "winleft",
+    "control": "ctrl",
+    "option": "alt",
     "esc": "escape",
     "return": "enter",
     "del": "delete",
@@ -339,6 +371,8 @@ _KEY_ALIASES = {
     "pgdown": "pagedown",
     "space": "space",
 }
+
+_MODIFIER_KEYS = {"ctrl", "shift", "alt", "winleft", "winright"}
 
 _HELD_KEYS: list[str] = []
 _HELD_MOUSE: set[str] = set()
@@ -350,6 +384,21 @@ def _parse_keys(keys: str) -> list[str]:
         cleaned = cleaned.replace(phrase, single)
     parts = [p.strip() for p in re.split(r"[+\s]+", cleaned) if p.strip()]
     return [_KEY_ALIASES.get(part, part) for part in parts]
+
+
+def _parse_modifiers(modifiers: str) -> tuple[list[str], str]:
+    """Parse click modifiers, rejecting ordinary keys that could get stuck down."""
+    parts = _parse_keys(modifiers)
+    parsed: list[str] = []
+    for part in parts:
+        if part not in _MODIFIER_KEYS:
+            return [], (
+                f"unsupported click modifier {part!r}; use ctrl, shift, alt "
+                "or win (for example \"ctrl+shift\")"
+            )
+        if part not in parsed:
+            parsed.append(part)
+    return parsed, ""
 
 
 def _release_keys(parts: list[str]) -> None:
@@ -846,6 +895,7 @@ def _build_ui_snapshot(window: str = "", max_items: int = 120) -> dict:
         "rect": tuple(target_info["rect"]),
         "text": text,
         "count": len(rows),
+        "truncated": truncated,
         "items": items,
     }
 
@@ -918,6 +968,18 @@ def _resolve_element(
     return None, f"no element matching {target!r} in {result['window']!r}; first controls: {visible}"
 
 
+def _element_enabled(item: dict) -> bool | None:
+    """Best-effort enabled state; some custom controls expose no UIA state."""
+    try:
+        return bool(item["control"].is_enabled())
+    except Exception:
+        return None
+
+
+def _norm_control_type(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
 # --------------------------------------------------------------------------
 # Optional local OCR (Tesseract; no model or API key)
 # --------------------------------------------------------------------------
@@ -962,15 +1024,22 @@ Preferred loop: call `snapshot` (one call = active window, accessibility tree wi
 element ids e1/e2/... and optionally a screenshot), then act on the UI by id or
 accessible name with `click_element`, `invoke_element`, `set_element_text` or
 `read_element`. These hit the real control without coordinate guessing and are far
-more reliable than clicking pixels. Take a fresh snapshot after the UI changes;
-ids belong to the latest snapshot.
+more reliable than clicking pixels. For a large window, `find_elements(query,
+window, control_type)` returns only the matching controls and their ids. Take a
+fresh snapshot after the UI changes; ids belong to the latest tree.
+
+Click modifiers: pass `modifiers="ctrl+shift"` to `click` or `click_element` for
+multi-select and range selection. Drag between controls with `drag_element(source,
+destination, window)`; it uses live element centers and always releases the mouse.
 
 If an app exposes no useful tree, fall back to the screenshot: coordinates you pass
 to click/drag/scroll are in the last screenshot's image space (possibly downscaled)
 and are mapped back to the right monitor or window automatically.
+`scroll(target=..., window=...)` places the wheel over a specific pane or list.
 
-Waits: use `wait_for_window` / `wait_for_element` instead of fixed sleeps. Holds:
-`key_down` / `key_up` (or `hold_key`) for modifier-based selections, `mouse_button`
+Waits: `wait_for_window` and `wait_for_element` accept `state="appear" | "close"`
+(and elements also `enabled` / `disabled`) instead of fixed sleeps. Holds:
+`key_down` / `key_up` (or `hold_key`) for custom modifier sequences, `mouse_button`
 for custom drags. Window control: `window_action` (activate/minimize/maximize/
 restore/move/resize). `launch` can take arguments and wait for a window.
 
@@ -982,6 +1051,13 @@ clicks will land on the wrong screen.
 Safety: the pointer corner aborts pyautogui. Prefer `close_window(title)` over a
 blind Alt+F4: it asks one specific window to close and never touches another.
 """
+
+if _read_only():
+    INSTRUCTIONS += (
+        "\nREAD-ONLY MODE is active: inspect with snapshot/ui_tree/screenshot/"
+        "find_elements/read_element, but all mouse, keyboard, window and launch "
+        "actions are blocked by the server.\n"
+    )
 
 mcp = FastMCP("computer-use", instructions=INSTRUCTIONS, log_level="WARNING")
 
@@ -1115,14 +1191,37 @@ def screen_info() -> str:
 
 @mcp.tool()
 @_safe
-def click(x: int, y: int, button: str = "left", clicks: int = 1) -> str:
-    """Click at (x, y) in the last screenshot's pixel space. button: left|right|middle."""
+def click(
+    x: int,
+    y: int,
+    button: str = "left",
+    clicks: int = 1,
+    modifiers: str = "",
+) -> str:
+    """Click at (x, y) in the last screenshot's pixel space.
+
+    button: left|right|middle. modifiers: optional ctrl, shift, alt or win,
+    for example "ctrl+shift" for multi-select or range selection.
+    """
     button = button if button in {"left", "right", "middle"} else "left"
     clicks = max(1, min(int(clicks), 3))
+    mods, error = _parse_modifiers(modifiers)
+    if error:
+        return f"failed: {error}"
     sx, sy = _to_screen(x, y)
-    pyautogui.click(sx, sy, clicks=clicks, interval=0.08 if clicks > 1 else 0.0, button=button)
+    try:
+        for key in mods:
+            pyautogui.keyDown(key)
+            time.sleep(0.03)
+        pyautogui.click(sx, sy, clicks=clicks, interval=0.08 if clicks > 1 else 0.0, button=button)
+    finally:
+        _release_keys(mods)
     time.sleep(0.2)
-    return f"{button} click x{clicks} at image ({x},{y}) -> screen ({sx},{sy}). Active: {_active_window_title()!r}"
+    prefix = f"{'+'.join(mods)}+" if mods else ""
+    return (
+        f"{prefix}{button} click x{clicks} at image ({x},{y}) -> screen ({sx},{sy}). "
+        f"Active: {_active_window_title()!r}"
+    )
 
 
 @mcp.tool()
@@ -1148,22 +1247,51 @@ def drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5, button: str 
 
 @mcp.tool()
 @_safe
-def scroll(amount: int, x: int = -1, y: int = -1, horizontal: bool = False) -> str:
+def scroll(
+    amount: int,
+    x: int = -1,
+    y: int = -1,
+    horizontal: bool = False,
+    target: str = "",
+    window: str = "",
+) -> str:
     """Scroll the wheel. Positive = up/right, negative = down/left; 1 ≈ one notch.
 
     Pass x/y (screenshot pixel space) to place the pointer there first; -1 keeps it.
+    Pass target (element id or accessible name) and window to scroll a specific list
+    or pane by placing the wheel over that control's center instead.
     Set horizontal=True to scroll sideways (e.g. wide pages or timelines).
     """
-    if x >= 0 and y >= 0:
-        pyautogui.moveTo(*_to_screen(x, y), duration=0.1)
     notches = max(-50, min(int(amount), 50))
+    place = ""
+    if (target or "").strip():
+        item, error = _resolve_element(target, window)
+        if item is None:
+            return f"failed: {error}"
+        ok, message = _focus_item_window(item)
+        if not ok:
+            return f"failed: {message}"
+        px, py = _element_center(item)
+        vx, vy, vw, vh = _monitor_info()["virtual"]
+        if not (vx <= px < vx + vw and vy <= py < vy + vh):
+            return f"failed: {item['name']!r} is outside every monitor at ({px},{py})"
+        pyautogui.moveTo(px, py, duration=0.1)
+        place = f"over {item['name']!r} at ({px},{py})"
+    elif x >= 0 and y >= 0:
+        px, py = _to_screen(x, y)
+        pyautogui.moveTo(px, py, duration=0.1)
+        place = f"at ({px},{py})"
+    else:
+        point = pyautogui.position()
+        place = f"at ({point.x},{point.y})"
+
     if horizontal:
         pyautogui.hscroll(notches)
     else:
         pyautogui.scroll(notches)
     time.sleep(0.2)
     axis = "horizontal" if horizontal else "vertical"
-    return f"scrolled {notches} {axis} notch(es) at {pyautogui.position()}"
+    return f"scrolled {notches} {axis} notch(es) {place}"
 
 
 def _type_text_impl(text: str, press_enter: bool = False) -> int:
@@ -1309,7 +1437,9 @@ def mouse_button(action: str = "down", button: str = "left") -> str:
 @_safe
 def clipboard(action: str = "get", text: str = "") -> str:
     """Read or write the Windows clipboard. action: get|set|paste (set + ctrl+v)."""
-    action = (action or "get").lower()
+    action = (action or "get").strip().lower()
+    if _read_only() and action != "get":
+        return _read_only_block()
     if action == "get":
         try:
             value = _clipboard_get()
@@ -1499,14 +1629,16 @@ def ui_tree(title: str = "", max_items: int = 140) -> str:
 
     Cheaper and more precise than clicking by eye. Empty `title` uses the active
     window. The ids it prints can be passed straight to click_element/invoke_element/
-    set_element_text/read_element (ids belong to the most recent tree or snapshot).
+    set_element_text/read_element/drag_element/scroll (ids belong to the most recent
+    tree or snapshot). For a large window, use find_elements to return only matches.
     """
     result = _build_ui_snapshot(title, max_items)
     if "error" in result:
         return "ui_tree: " + result["error"]
     return (
         result["text"]
-        + "\nAct with click_element/invoke_element/set_element_text/read_element using these ids or names."
+        + "\nAct with click_element/invoke_element/set_element_text/read_element/"
+        "drag_element/scroll using these ids or names; or narrow with find_elements."
     )
 
 
@@ -1530,8 +1662,9 @@ def snapshot(
 
     text = (
         result["text"]
-        + "\nAct with click_element/invoke_element/set_element_text/read_element "
-        "using these ids or names; ids belong to this snapshot."
+        + "\nAct with click_element/invoke_element/set_element_text/read_element/"
+        "drag_element/scroll using these ids or names; ids belong to this snapshot. "
+        "For a large tree, find_elements returns only matches."
     )
     if not screenshot:
         return [text]
@@ -1573,6 +1706,96 @@ def snapshot(
     return [MCPImage(data=data, format="png"), text]
 
 
+@mcp.tool()
+@_safe
+def find_elements(
+    query: str = "",
+    window: str = "",
+    control_type: str = "",
+    limit: int = 20,
+) -> str:
+    """Search a window's accessibility tree and return only matching controls.
+
+    query matches an accessible name or control type (case-insensitive; an exact
+    eN id also works). control_type narrows it (for example "Button", "Edit",
+    "ListItem"). Empty query with a type lists that type; empty both lists the
+    first controls. Results carry live eN ids usable by click_element,
+    invoke_element, set_element_text, read_element, drag_element and scroll.
+    This is much cheaper than dumping a large ui_tree.
+    """
+    needle = (query or "").strip().lower()
+    kind = _norm_control_type(control_type)
+    limit = max(1, min(int(limit), 100))
+    result = _build_ui_snapshot(window, 400)
+    if "error" in result:
+        return "find_elements: " + result["error"]
+
+    items = list(result["items"].values())
+
+    exact_id = result["items"].get(needle) if re.fullmatch(r"e\d+", needle) else None
+    if exact_id is not None:
+        enabled = _element_enabled(exact_id)
+        left, top, width, height = exact_id["rect"]
+        suffix = " [disabled]" if enabled is False else ""
+        return (
+            f"{exact_id['id']} {exact_id['type']} {exact_id['name']!r} "
+            f"at ({left},{top},{width},{height}) in {result['window']!r}{suffix}"
+        )
+
+    ranked: list[tuple] = []
+    for item in items:
+        type_key = _norm_control_type(item["type"])
+        if kind and type_key != kind:
+            continue
+        type_rank = _CLICKABLE.index(item["type"]) if item["type"] in _CLICKABLE else 99
+        if not needle:
+            rank = 0
+        else:
+            name = item["name"].lstrip("* ").lower()
+            if name == needle:
+                rank = 0
+            elif name.startswith(needle):
+                rank = 1
+            elif needle in name:
+                rank = 2
+            elif type_key == needle:
+                rank = 3
+            elif needle in type_key:
+                rank = 4
+            else:
+                continue
+        ranked.append((rank, type_rank, item["rect"][1], item["rect"][0], item))
+
+    ranked.sort(key=lambda row: row[:4])
+    total_matches = len(ranked)
+    selected = [row[4] for row in ranked[:limit]]
+
+    header = (
+        f"{total_matches} match(es) in {result['window']!r} hwnd={result['hwnd']} "
+        f"from {result['count']} controls"
+    )
+    if result.get("truncated"):
+        header += " (tree truncated at 400; narrow the query/window if needed)"
+    if not selected:
+        return (
+            f"{header}. No matching controls. Try a shorter query, a control_type, "
+            "or take snapshot/ui_tree to see the available names."
+        )
+
+    rows = []
+    for item in selected:
+        enabled = _element_enabled(item)
+        left, top, width, height = item["rect"]
+        suffix = " [disabled]" if enabled is False else ""
+        rows.append(
+            f"{item['id']:<4} {item['type']:<13} "
+            f"[{left},{top},{width},{height}] {item['name']}{suffix}"
+        )
+    if total_matches > len(selected):
+        header += f"; showing first {len(selected)} (raise limit for more)"
+    return header + "\n" + "\n".join(rows)
+
+
 def _element_center(item: dict) -> tuple[int, int]:
     """Current screen-space center of a cached control (re-reads the live rect)."""
     try:
@@ -1595,18 +1818,88 @@ def _focus_item_window(item: dict) -> tuple[bool, str]:
 
 @mcp.tool()
 @_safe
-def click_element(target: str, window: str = "", button: str = "left", clicks: int = 1) -> str:
+def drag_element(
+    source: str,
+    destination: str,
+    window: str = "",
+    duration: float = 0.6,
+    button: str = "left",
+) -> str:
+    """Drag from one accessible element to another in the same window.
+
+    source/destination are eN ids or accessible names. Uses each control's live
+    center, focuses their window first, and always releases the mouse even when
+    the drag raises. Use this for file moves, list/tree reordering and drag-drop
+    targets where pixel coordinates would be fragile.
+    """
+    source_item, error = _resolve_element(source, window)
+    if source_item is None:
+        return f"failed: source {error}"
+    dest_item, error = _resolve_element(destination, window)
+    if dest_item is None:
+        return f"failed: destination {error}"
+    if source_item["hwnd"] != dest_item["hwnd"]:
+        return "failed: source and destination must belong to the same window"
+    if source_item["id"] == dest_item["id"]:
+        return "failed: source and destination are the same element"
+
+    ok, message = _focus_item_window(source_item)
+    if not ok:
+        return f"failed: {message}"
+
+    sx, sy = _element_center(source_item)
+    dx, dy = _element_center(dest_item)
+    vx, vy, vw, vh = _monitor_info()["virtual"]
+    for label, point in (("source", (sx, sy)), ("destination", (dx, dy))):
+        x, y = point
+        if not (vx <= x < vx + vw and vy <= y < vy + vh):
+            return f"failed: {label} is outside every monitor at ({x},{y})"
+
+    button = button if button in {"left", "right", "middle"} else "left"
+    pyautogui.moveTo(sx, sy, duration=0.2)
+    _HELD_MOUSE.add(button)
+    try:
+        pyautogui.mouseDown(button=button)
+        time.sleep(0.15)
+        pyautogui.moveTo(dx, dy, duration=max(0.1, min(float(duration), 3.0)))
+        time.sleep(0.15)
+    finally:
+        try:
+            pyautogui.mouseUp(button=button)
+        finally:
+            _HELD_MOUSE.discard(button)
+    time.sleep(0.25)
+    return (
+        f"dragged {source_item['name']!r} ({source_item['type']}) from screen "
+        f"({sx},{sy}) to {dest_item['name']!r} ({dest_item['type']}) at ({dx},{dy}) "
+        f"in {source_item['window']!r}"
+    )
+
+
+@mcp.tool()
+@_safe
+def click_element(
+    target: str,
+    window: str = "",
+    button: str = "left",
+    clicks: int = 1,
+    modifiers: str = "",
+) -> str:
     """Click a UI element by id ("e12") or accessible name (e.g. "Save", "Cancel").
 
     Focuses the element's window first, then clicks the center of the live control
-    rectangle. This is the reliable alternative to guessing screenshot coordinates.
-    Use invoke_element for buttons/menu items that support UI Automation invoke.
+    rectangle. modifiers: optional ctrl, shift, alt or win, for example
+    "ctrl+shift" for multi-select or range selection. Use invoke_element for
+    buttons/menu items that support UI Automation invoke.
     """
     item, error = _resolve_element(target, window, _CLICKABLE)
     if item is None:
         return f"failed: {error}"
     button = button if button in {"left", "right", "middle"} else "left"
     clicks = max(1, min(int(clicks), 3))
+    mods, error = _parse_modifiers(modifiers)
+    if error:
+        return f"failed: {error}"
 
     ok, message = _focus_item_window(item)
     if not ok:
@@ -1615,10 +1908,17 @@ def click_element(target: str, window: str = "", button: str = "left", clicks: i
     vx, vy, vw, vh = _monitor_info()["virtual"]
     if not (vx <= x < vx + vw and vy <= y < vy + vh):
         return f"failed: {item['name']!r} is outside every monitor at ({x},{y})"
-    pyautogui.click(x, y, clicks=clicks, interval=0.08 if clicks > 1 else 0.0, button=button)
+    try:
+        for key in mods:
+            pyautogui.keyDown(key)
+            time.sleep(0.03)
+        pyautogui.click(x, y, clicks=clicks, interval=0.08 if clicks > 1 else 0.0, button=button)
+    finally:
+        _release_keys(mods)
     time.sleep(0.25)
+    prefix = f"{'+'.join(mods)}+" if mods else ""
     return (
-        f"clicked {item['name']!r} ({item['type']}) at screen ({x},{y}); "
+        f"{prefix}clicked {item['name']!r} ({item['type']}) at screen ({x},{y}); "
         f"active={_active_window_title()!r}"
     )
 
@@ -1745,25 +2045,51 @@ def read_element(target: str, window: str = "") -> str:
 
 @mcp.tool()
 @_safe
-def wait_for_window(title: str, timeout: float = 10.0) -> str:
-    """Wait until a visible window whose title contains `title` exists.
+def wait_for_window(title: str, timeout: float = 10.0, state: str = "appear") -> str:
+    """Wait for a visible window to appear or close.
 
-    Returns its title/handle/rect, or a timeout message listing visible windows.
-    Much better than a fixed sleep after launch or a slow dialog.
+    state="appear" (default) waits for a title match; state="close" waits until no
+    visible window matches. Returns the window details, or a timeout listing what
+    is visible. Much better than a fixed sleep after launch or a slow dialog.
     """
     needle = (title or "").strip().lower()
     if not needle:
         return "title must not be empty"
+    state = (state or "appear").strip().lower()
+    if state not in {"appear", "close"}:
+        return "state must be appear or close"
     timeout = max(0.2, min(float(timeout), 120.0))
     start = time.monotonic()
+    seen: dict | None = None
     while True:
-        for window in _list_windows():
-            if needle in window["title"].lower():
+        matches = [w for w in _list_windows() if needle in w["title"].lower()]
+        elapsed = time.monotonic() - start
+        if state == "appear" and matches:
+            window = matches[0]
+            return (
+                f"appeared after {elapsed:.1f}s: {window['title']!r} "
+                f"hwnd={window['hwnd']} rect={window['rect']}"
+            )
+        if state == "close":
+            if matches:
+                seen = matches[0]
+            else:
+                if seen:
+                    return (
+                        f"closed after {elapsed:.1f}s: {seen['title']!r} "
+                        "is no longer visible"
+                    )
                 return (
-                    f"appeared after {time.monotonic() - start:.1f}s: {window['title']!r} "
-                    f"hwnd={window['hwnd']} rect={window['rect']}"
+                    f"already closed after {elapsed:.1f}s: no visible window title "
+                    f"contains {title!r}"
                 )
-        if time.monotonic() - start >= timeout:
+        if elapsed >= timeout:
+            if state == "close":
+                visible = matches[0]["title"] if matches else "(none)"
+                return (
+                    f"timed out after {timeout:g}s waiting for {title!r} to close; "
+                    f"still visible: {visible}"
+                )
             visible = ", ".join(w["title"] for w in _list_windows()[:6])
             return (
                 f"timed out after {timeout:g}s waiting for {title!r}; "
@@ -1774,35 +2100,88 @@ def wait_for_window(title: str, timeout: float = 10.0) -> str:
 
 @mcp.tool()
 @_safe
-def wait_for_element(target: str, window: str = "", timeout: float = 10.0) -> str:
-    """Wait until an element matching an id or accessible name exists, then return it.
+def wait_for_element(
+    target: str,
+    window: str = "",
+    timeout: float = 10.0,
+    state: str = "appear",
+) -> str:
+    """Wait for an element to appear, close, become enabled or become disabled.
 
-    Rebuilds the accessibility tree while polling, so a successful wait also leaves
-    a fresh element cache ready for click_element/invoke_element/set_element_text.
+    target is an accessible name (or an eN id from the latest tree; names are
+    safer while the tree is changing). state="appear" (default), "close",
+    "enabled" or "disabled". Rebuilds the accessibility tree while polling, so a
+    successful wait also leaves a fresh element cache ready for subsequent
+    click_element/invoke_element/set_element_text calls. Pass window for dialogs:
+    it keeps the search in the right window while the UI changes.
     """
     needle = (target or "").strip()
     if not needle:
         return "target must not be empty"
+    state = (state or "appear").strip().lower()
+    if state not in {"appear", "close", "enabled", "disabled"}:
+        return "state must be appear, close, enabled or disabled"
     timeout = max(0.2, min(float(timeout), 120.0))
     start = time.monotonic()
     last_error = ""
+    seen: dict | None = None
     while True:
         result = _build_ui_snapshot(window, 160)
+        elapsed = time.monotonic() - start
         if "error" in result:
             last_error = result["error"]
+            if state == "close" and result["error"].startswith("no visible window matching"):
+                return (
+                    f"closed after {elapsed:.1f}s: no visible window matching "
+                    f"{window!r} remains"
+                )
         else:
             item = _find_in_cache(needle)
             if item is not None:
+                seen = item
                 left, top, width, height = item["rect"]
-                return (
-                    f"found after {time.monotonic() - start:.1f}s: {item['id']} "
-                    f"{item['type']} {item['name']!r} at ({left},{top},{width},{height}) "
-                    f"in {result['window']!r}"
+                label = (
+                    f"{item['id']} {item['type']} {item['name']!r} "
+                    f"at ({left},{top},{width},{height}) in {result['window']!r}"
                 )
-        if time.monotonic() - start >= timeout:
+                if state == "appear":
+                    return f"found after {elapsed:.1f}s: {label}"
+                if state == "enabled":
+                    enabled = _element_enabled(item)
+                    if enabled is True:
+                        return f"enabled after {elapsed:.1f}s: {label}"
+                    if enabled is None:
+                        return (
+                            f"found after {elapsed:.1f}s but its enabled state could "
+                            f"not be read: {label}"
+                        )
+                elif state == "disabled":
+                    if _element_enabled(item) is False:
+                        return f"disabled after {elapsed:.1f}s: {label}"
+            elif state == "close":
+                if seen:
+                    return (
+                        f"disappeared after {elapsed:.1f}s: {seen['name']!r} "
+                        f"({seen['type']}) is no longer in {result['window']!r}"
+                    )
+                return (
+                    f"already absent after {elapsed:.1f}s: no element matching "
+                    f"{target!r} in {result['window']!r}"
+                )
+        if elapsed >= timeout:
             detail = f"; last error: {last_error}" if last_error else ""
+            if state == "close":
+                return (
+                    f"timed out after {timeout:g}s waiting for {target!r} to close; "
+                    f"it is still present{detail}"
+                )
+            if state in {"enabled", "disabled"}:
+                return (
+                    f"timed out after {timeout:g}s waiting for {target!r} to become "
+                    f"{state}{detail}"
+                )
             return f"timed out after {timeout:g}s waiting for {target!r}{detail}"
-        time.sleep(0.5)
+        time.sleep(0.4)
 
 
 @mcp.tool()
@@ -1873,6 +2252,7 @@ def runtime_status() -> str:
             "tesseract": _tesseract_exe() or "not installed (OCR disabled)",
             "session_token": "active",
             "launcher_lease": "active" if lease else "not configured",
+            "read_only": _read_only(),
         },
         indent=2,
     )

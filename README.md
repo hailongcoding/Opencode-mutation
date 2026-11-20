@@ -20,18 +20,21 @@ then act on them by id/name instead of guessing pixels.
 | Tool | What it does |
 | --- | --- |
 | `snapshot` | **Start here.** One call returns the active window, its accessible tree with `eN` ids, and a screenshot |
-| `click_element`, `invoke_element` | Click or invoke a control by id (`e12`) or name (`"Save"`); `invoke_element` uses UI Automation and needs no mouse move |
+| `find_elements` | Search the tree by name/type and return only matches with ids and bounds — much cheaper than dumping a large window |
+| `click_element`, `invoke_element` | Click or invoke a control by id (`e12`) or name (`"Save"`); `click_element` accepts `modifiers="ctrl+shift"`, and `invoke_element` uses UI Automation without a mouse move |
+| `drag_element` | Drag from one element to another by id/name (file moves, list/tree reordering), with a guaranteed mouse release |
 | `set_element_text`, `read_element` | Write/read an edit box, label or list row directly |
 | `ui_tree` | Text-only tree with the same ids (cheap refresh) |
 | `screenshot` | Capture a monitor, all monitors, a rectangle (`region`), or one window (even if behind another); optional OCR |
-| `click`, `move`, `drag`, `scroll` | Pixel fallback for apps with no useful tree; coordinates come from the last screenshot. `scroll(horizontal=true)` for sideways |
+| `click`, `move`, `drag`, `scroll` | Pixel fallback for apps with no useful tree; coordinates come from the last screenshot. `scroll(target=..., window=...)` scrolls a specific pane, and `scroll(horizontal=true)` goes sideways |
 | `type_text` | Types arbitrary Unicode (emoji, accents, tabs, newlines) |
 | `press_keys` | Key combos: `ctrl+c`, `alt+f4`, `enter`, `win`, ... |
-| `key_down`, `key_up`, `hold_key`, `mouse_button` | Modifier/mouse holds for ranges, selections and custom drags |
+| `key_down`, `key_up`, `hold_key`, `mouse_button` | Modifier/mouse holds for custom sequences, selections and drags |
 | `clipboard` | Get / set / paste clipboard text |
 | `list_windows`, `focus_window`, `close_window`, `window_action`, `screen_info` | Window inventory, monitor layout, focus, targeted close (safer than a blind `alt+f4`), and minimize/maximize/restore/move/resize |
-| `wait_for_window`, `wait_for_element`, `wait`, `launch` | Wait for a window/control instead of sleeping; launch apps with arguments and wait for their window |
-| `runtime_status` | Native readiness: screen/monitors, active window, screenshot mapping, OCR and the launcher lease |
+| `wait_for_window`, `wait_for_element` | Wait for a window to appear/close, or an element to appear/close/become enabled/disabled — no fixed sleeps |
+| `wait`, `launch` | Explicit delay when needed; launch apps with arguments and wait for their window |
+| `runtime_status` | Native readiness: screen/monitors, active window, screenshot mapping, OCR, launcher lease and read-only state |
 
 Multi-monitor is handled natively: `screen_info` shows the physical layout
 (`x,y,width,height`; primary first), `screenshot(monitor=0|1|...|-1)` picks a
@@ -87,6 +90,7 @@ use the normal private `--standalone` launch:
 .\Computer-Use.cmd pair                 # local / LAN links
 .\Computer-Use.cmd pair --remote        # public OpenTunnel link (asks first)
 .\Computer-Use.cmd pair --remote --yes  # accept the exposure without prompting
+.\Computer-Use.cmd pair --remote --read-only   # observe only, never control
 .\Computer-Use.cmd pair --remote -Directory C:\Users\Admin\projects\demo
 ```
 
@@ -115,6 +119,30 @@ valid one-time link can control this PC through OpenCode, so treat pairing links
 like passwords. The MCP process also carries a launcher-PID lease: if the window
 is force-closed, it exits and refuses further tool calls instead of staying live.
 
+### Read-only mode
+
+Use this when you want someone (or a remote session) to look at the desktop but
+never touch it:
+
+```powershell
+.\Computer-Use.cmd -ReadOnly
+.\Computer-Use.cmd pair --remote --read-only
+$env:COMPUTER_USE_READ_ONLY = "1"; .\Computer-Use.cmd pair
+```
+
+The MCP server enforces the policy itself, not just the prompt. It allows
+`snapshot`, `ui_tree`, `find_elements`, `screenshot`, `read_element`,
+`list_windows`, `wait_for_window`, `wait_for_element`, `wait`, `screen_info`,
+`runtime_status`, and `clipboard(action="get")`. It blocks every mutating call:
+mouse/keyboard input, element clicks/invokes/text writes, drags, scrolling,
+window focus/move/close, clipboard writes/paste, and `launch`. The block returns a
+clear `BLOCKED: ... read-only` message.
+
+Read-only is an action policy, not a privacy filter: the inspection tools still
+expose screen contents and the clipboard to the model you are using. It is also
+not a Windows security boundary — the server runs as your user. Treat it as a
+strong guardrail against accidental edits, not a sandbox.
+
 **Nothing needs to be installed first** — no Node, no npm, no Bun, and no system
 Python. On first run the launcher uses the portable OpenCode + `uv` already in
 `vendor\` (or downloads them, ~150 MB, checksum-verified), downloads a **private
@@ -139,7 +167,7 @@ switches:
 | Switch | Effect |
 | --- | --- |
 | `-Reinstall` | Wipe and rebuild `.runtime\venv` |
-| `-SelfTest` | Check every primitive (screenshot, clipboard, real Unicode typing into a scratch window the test owns, accessibility snapshot, element actions on a throwaway Run dialog, launch/wait, window list) without launching OpenCode |
+| `-SelfTest` | Check every primitive (screenshot, clipboard, real Unicode typing into a scratch window the test owns, accessibility search/snapshot, element actions on a throwaway Run dialog, modifier click, element drag, targeted scroll, wait states, launch/wait, read-only enforcement) without launching OpenCode |
 | `-PrepareVendor` | Copy portable OpenCode + uv into `vendor\` (toolchain only; Python and packages are still downloaded on first run) |
 
 An older install that still carries the previous agent packages can reclaim the
@@ -245,6 +273,8 @@ background process after detach.
 
 - Automation moves your real mouse and keyboard. `pyautogui` failsafe is on: slam
   the pointer into a screen corner to abort.
+- `-ReadOnly` / `--read-only` blocks actions inside the server, but inspection
+  still exposes the screen and clipboard. It is a guardrail, not a sandbox.
 - `invoke_element` acts through UI Automation without moving the pointer, but it is
   still a real action. Read the target name before clicking something destructive.
 - Prefer `snapshot`/`click_element`/`set_element_text` over blind pixel clicks.
@@ -269,6 +299,7 @@ background process after detach.
 | `pair` says a `computer` server already exists | Close the other Computer-Use window, or run `opencode service restart` to clear a stale runtime entry, then retry |
 | Pair mode window was force-closed | The MCP lease makes the old server inert. Relaunch `pair`; if the service still lists a stale entry, run `opencode service restart` |
 | `Refusing to start: no active launcher session` | Start through `Computer-Use.cmd`; that message means the server was run outside the launcher |
+| `BLOCKED: this Computer-Use session is read-only` | Relaunch without `-ReadOnly` / `--read-only` (and clear `COMPUTER_USE_READ_ONLY`) if the session is supposed to act |
 | Clicks land slightly off | Screenshots are scaled; always click using coordinates from the most recent `screenshot`, and capture the monitor that holds the target window |
 | `snapshot`/`ui_tree` shows no controls | That app exposes no useful UI Automation tree (some games, some Tk/Electron builds). Use `screenshot` + `click`/`type_text` instead |
 | `snapshot`/`ui_tree` is slow or hangs | One control's accessibility provider is stalling. Retry with a smaller `max_items`, target the exact window, or use `screenshot` for that app |
@@ -287,7 +318,7 @@ Logs from the MCP server sessions land in `.runtime\logs\sessions.log`.
 ```text
 Computer-Use.cmd              <- double-click this (session-only launcher)
 scripts\Start-ComputerUse.ps1 <- bootstrap: portable tools, runtime, token, launch
-scripts\computer_use_mcp.py   <- the computer-use MCP server (28 tools)
+scripts\computer_use_mcp.py   <- the computer-use MCP server (30 tools)
 scripts\selftest.py           <- -SelfTest implementation
 scripts\scratch_editor.py     <- throwaway Tk window the self-test types into
 vendor\opencode\opencode.exe  <- portable OpenCode (compiled binary, embedded Bun)

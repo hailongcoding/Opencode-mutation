@@ -21,6 +21,9 @@
     Nothing is written to your global OpenCode config, PATH, or any machine-wide
     location. When OpenCode exits, the ability is gone.
 
+    -ReadOnly (or --read-only) keeps the inspection tools but blocks every input,
+    window and launch action inside the MCP server.
+
 .PARAMETER Reinstall
     Delete and rebuild .runtime\venv from scratch.
 
@@ -32,8 +35,9 @@
     toolchain portable (no npm/Node), but the first run still needs network for
     the private Python and Python packages unless a working .runtime is included.
 
-.PARAMETER Directory
-    Working directory for OpenCode (defaults to the current folder).
+.PARAMETER ReadOnly
+    Start with inspection tools only (snapshot, tree, screenshots, reads, waits).
+    Every mouse, keyboard, window and launch action is blocked by the MCP server.
 
 .EXAMPLE
     .\Computer-Use.cmd
@@ -44,21 +48,59 @@
 .EXAMPLE
     .\Computer-Use.cmd -SelfTest
 .EXAMPLE
+    .\Computer-Use.cmd -ReadOnly
+.EXAMPLE
     .\Computer-Use.cmd pair
 .EXAMPLE
     .\Computer-Use.cmd pair --remote
+.EXAMPLE
+    .\Computer-Use.cmd pair --remote --read-only
+
+.NOTES
+    -Directory <path> selects the OpenCode working folder. It is parsed with the
+    passthrough arguments so that `pair` and other subcommands keep working.
 #>
 [CmdletBinding()]
 param(
     [switch]$Reinstall,
     [switch]$SelfTest,
     [switch]$PrepareVendor,
-    [string]$Directory,
+    [switch]$ReadOnly,
+    # Everything else (including `pair` and `-Directory <path>`) is parsed here.
+    # Keeping a typed positional -Directory parameter would swallow `pair`.
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$OpenCodeArgs
 )
 
 $ErrorActionPreference = "Stop"
+
+# --read-only is a launcher flag, not an OpenCode flag. -Directory is parsed
+# manually because PowerShell would otherwise bind the `pair` subcommand to it.
+$readOnlyMode = $ReadOnly.IsPresent
+if ($env:COMPUTER_USE_READ_ONLY -match '^(1|true|yes|on)$') { $readOnlyMode = $true }
+$directoryArgument = $null
+$directoryError = ""
+$filteredArgs = @()
+$rawArgs = @($OpenCodeArgs)
+for ($index = 0; $index -lt $rawArgs.Count; $index++) {
+    $argument = [string]$rawArgs[$index]
+    if ($argument -ieq "--read-only") {
+        $readOnlyMode = $true
+    } elseif ($argument -ieq "-Directory" -or $argument -ieq "--directory") {
+        if ($index + 1 -ge $rawArgs.Count) {
+            $directoryError = "-Directory requires a folder path."
+            break
+        }
+        $directoryArgument = [string]$rawArgs[$index + 1]
+        $index++
+    } elseif ($argument -match '^-{1,2}directory=(.+)$') {
+        $directoryArgument = $matches[1]
+    } else {
+        $filteredArgs += $argument
+    }
+}
+$OpenCodeArgs = $filteredArgs
+$Directory = $directoryArgument
 
 $script:Root = Split-Path -Parent $PSScriptRoot
 $script:Runtime = Join-Path $script:Root ".runtime"
@@ -96,6 +138,8 @@ function Fail {
     Write-Host ("`n[computer-use] {0}" -f $Message) -ForegroundColor Red
     exit 1
 }
+
+if ($directoryError) { Fail $directoryError }
 
 # PowerShell 5.1 turns native stderr into a terminating error when
 # ErrorActionPreference is Stop (uv, pip, curl and opencode all write there).
@@ -463,6 +507,7 @@ if ($SelfTest) {
     Write-Host ""
     Write-Step "Running self-test (no OpenCode, no global changes)..."
     $env:COMPUTER_USE_SESSION_TOKEN = "selftest"
+    Remove-Item Env:\COMPUTER_USE_READ_ONLY -ErrorAction SilentlyContinue
     Invoke-External { & $script:VenvPy (Join-Path $PSScriptRoot "selftest.py") }
     $selfExit = $script:LastExitCode
     Remove-Item Env:\COMPUTER_USE_SESSION_TOKEN -ErrorAction SilentlyContinue
@@ -473,14 +518,16 @@ if ($SelfTest) {
 
 # --------------------------------------------------------------- session token
 $token = [Guid]::NewGuid().ToString("N")
+$serverEnvironment = [ordered]@{
+    COMPUTER_USE_SESSION_TOKEN = $token
+    COMPUTER_USE_PARENT_PID    = "$PID"
+}
+if ($readOnlyMode) { $serverEnvironment["COMPUTER_USE_READ_ONLY"] = "1" }
 $serverEntry = [ordered]@{
     type        = "local"
     command     = @($script:VenvPy, $script:ServerScript)
     cwd         = $script:Root
-    environment = [ordered]@{
-        COMPUTER_USE_SESSION_TOKEN = $token
-        COMPUTER_USE_PARENT_PID    = "$PID"
-    }
+    environment = $serverEnvironment
     timeout     = [ordered]@{ startup = 120000; catalog = 60000 }
 }
 
@@ -508,6 +555,9 @@ if ($pairMode) {
     Write-Host ""
     Write-Step "Pair mode uses OpenCode's background service (not --standalone)."
     Write-Step "Computer use will be added for this folder only: $runDirectory"
+    if ($readOnlyMode) {
+        Write-Warn "Read-only mode: the paired session can inspect the desktop but cannot act."
+    }
 
     $serviceWasRunning = $false
     $before = Invoke-OpenCodeCapture @("service", "status")
@@ -530,6 +580,7 @@ if ($pairMode) {
     Remove-Item Env:\OPENCODE_CONFIG_CONTENT -ErrorAction SilentlyContinue
     Remove-Item Env:\COMPUTER_USE_SESSION_TOKEN -ErrorAction SilentlyContinue
     Remove-Item Env:\COMPUTER_USE_PARENT_PID -ErrorAction SilentlyContinue
+    Remove-Item Env:\COMPUTER_USE_READ_ONLY -ErrorAction SilentlyContinue
 
     Push-Location $runDirectory
     try {
@@ -580,10 +631,7 @@ if ($pairMode) {
                                 type        = "local"
                                 command     = @($script:VenvPy, $script:ServerScript)
                                 cwd         = $script:Root
-                                environment = [ordered]@{
-                                    COMPUTER_USE_SESSION_TOKEN = $token
-                                    COMPUTER_USE_PARENT_PID    = "$PID"
-                                }
+                                environment = $serverEnvironment
                                 timeout     = [ordered]@{ startup = 120000; catalog = 60000 }
                             }
                         } | ConvertTo-Json -Depth 20 -Compress
@@ -630,6 +678,9 @@ if ($pairMode) {
                             } else {
                                 Write-Warn "Computer use was added but has not reported 'connected' yet."
                                 Write-Step "The paired session can retry once the MCP server finishes starting."
+                            }
+                            if ($readOnlyMode) {
+                                Write-Step "MCP server policy: read-only (inspection tools only)."
                             }
                             Write-Step "Background service: $serviceUrl"
                             Write-Step "In the paired app, open this folder as the project: $runDirectory"
@@ -722,7 +773,12 @@ $env:COMPUTER_USE_SESSION_TOKEN = $token
 $env:OPENCODE_CONFIG_CONTENT = $configJson
 
 # ------------------------------------------------------------------- launching
-Write-Ok "Native computer use attached for this session (UI Automation + screen/mouse/keyboard)."
+if ($readOnlyMode) {
+    Write-Ok "Native computer use attached for this session in READ-ONLY mode."
+    Write-Step "Inspection only: snapshot/tree/screenshots/reads/waits; actions are blocked."
+} else {
+    Write-Ok "Native computer use attached for this session (UI Automation + screen/mouse/keyboard)."
+}
 Write-Step "Session token: $($token.Substring(0, 8))... (dies with this process)"
 Write-Step "No global config was modified. Ctrl+C / exit OpenCode to detach."
 
