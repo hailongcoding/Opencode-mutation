@@ -919,30 +919,8 @@ def _resolve_element(
 
 
 # --------------------------------------------------------------------------
-# Optional extras (only if Agent-S / tesseract are present)
+# Optional local OCR (Tesseract; no model or API key)
 # --------------------------------------------------------------------------
-
-def _scripts_dirs() -> list[str]:
-    """Candidate Scripts folders (uv/virtualenv launchers do not always agree with sys.executable)."""
-    bases = [sys.prefix, os.environ.get("VIRTUAL_ENV", ""), os.path.dirname(sys.executable)]
-    dirs = []
-    for base in bases:
-        if not base:
-            continue
-        candidate = os.path.join(base, "Scripts") if os.path.isdir(os.path.join(base, "Scripts")) else base
-        if candidate not in dirs:
-            dirs.append(candidate)
-    return dirs
-
-
-def _agent_s_exe() -> str | None:
-    for folder in _scripts_dirs():
-        for name in ("agent_s.exe", "agent_s"):
-            path = os.path.join(folder, name)
-            if os.path.exists(path):
-                return path
-    return None
-
 
 def _tesseract_exe() -> str | None:
     env = os.environ.get("TESSERACT_CMD")
@@ -1881,85 +1859,20 @@ def window_action(
 
 @mcp.tool()
 @_safe
-def agent_s(task: str, max_steps: int = 15) -> str:
-    """Hand a task to the installed Agent-S GUI agent (autonomous, needs model API keys + grounding endpoint).
-
-    For most work prefer driving the screen yourself with screenshot/click/type_text.
-    """
-    exe = _agent_s_exe()
-    if not exe:
-        return (
-            "Agent-S is not installed in this runtime. Run the launcher without -NoAgentS, "
-            "or use screenshot/click/type_text to drive the GUI yourself."
-        )
-
-    provider = os.environ.get("AGENT_S_PROVIDER", "openai")
-    model = os.environ.get("AGENT_S_MODEL", "gpt-5-2025-08-07")
-    ground_url = os.environ.get("AGENT_S_GROUND_URL", "").strip()
-    ground_model = os.environ.get("AGENT_S_GROUND_MODEL", "ui-tars-1.5-7b").strip()
-    if not ground_url:
-        return (
-            "Agent-S needs a grounding endpoint. Set AGENT_S_GROUND_URL (e.g. a vLLM/TGI "
-            "server hosting UI-TARS) plus AGENT_S_GROUND_MODEL and a model API key, then "
-            "relaunch. Until then use screenshot/click/type_text yourself."
-        )
-
-    cmd = [
-        exe,
-        "--provider", provider,
-        "--model", model,
-        "--ground_provider", os.environ.get("AGENT_S_GROUND_PROVIDER", "huggingface"),
-        "--ground_url", ground_url,
-        "--ground_model", ground_model,
-        "--grounding_width", os.environ.get("AGENT_S_GROUNDING_WIDTH", "1920"),
-        "--grounding_height", os.environ.get("AGENT_S_GROUNDING_HEIGHT", "1080"),
-        "--max_trajectory_length", str(max(2, min(int(max_steps), 40))),
-        "--task", task,
-    ]
-    key = os.environ.get("AGENT_S_GROUND_API_KEY")
-    if key:
-        cmd += ["--ground_api_key", key]
-
-    log_path = os.path.join(ROOT, ".runtime", "logs", f"agent-s-{int(time.time())}.log")
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    sys.stderr.write("[computer-use] running: " + " ".join(cmd) + "\n")
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-    except subprocess.TimeoutExpired:
-        return f"Agent-S timed out after 600s (log: {log_path})"
-
-    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    with open(log_path, "w", encoding="utf-8", errors="replace") as handle:
-        handle.write(output)
-    tail = output.strip()[-4000:]
-    status = "finished" if proc.returncode == 0 else f"exited with code {proc.returncode}"
-    return f"Agent-S {status} for task {task!r}. Full log: {log_path}\n\n{tail}"
-
-
-@mcp.tool()
-@_safe
-def agent_status() -> str:
-    """Report runtime readiness: screen, Agent-S CLI, API keys, grounding, Tesseract."""
-    exe = _agent_s_exe()
-    keys = [k for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "HF_TOKEN") if os.environ.get(k)]
-    tesseract = _tesseract_exe()
+def runtime_status() -> str:
+    """Report native runtime readiness: screen, monitors, active window, OCR and launcher lease."""
+    lease = bool(os.environ.get(PARENT_ENV))
     return json.dumps(
         {
             "python": sys.executable,
             "platform": platform.platform(),
             "screen": list(pyautogui.size()),
-            "agent_s_cli": exe or "not installed",
-            "api_keys_present": keys or "none",
-            "grounding_url": os.environ.get("AGENT_S_GROUND_URL") or "not set",
-            "tesseract": tesseract or "not installed (OCR disabled)",
+            "monitors": _monitors(),
+            "active_window": _active_window_title(),
+            "screenshot_mapping": _shot,
+            "tesseract": _tesseract_exe() or "not installed (OCR disabled)",
             "session_token": "active",
+            "launcher_lease": "active" if lease else "not configured",
         },
         indent=2,
     )

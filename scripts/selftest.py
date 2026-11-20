@@ -2,7 +2,7 @@
 
 Checks, in order:
   * every tool is registered
-  * agent_status / screen_info answer
+  * runtime_status / screen_info answer
   * screenshots come back as images
   * the clipboard round-trips (accented text, emoji, newlines)
   * accessibility snapshot returns a tree plus an image
@@ -47,7 +47,7 @@ EXPECTED_TOOLS = {
     "clipboard", "list_windows", "focus_window", "close_window", "launch", "wait",
     "ui_tree", "snapshot", "click_element", "invoke_element", "set_element_text",
     "read_element", "wait_for_window", "wait_for_element", "window_action",
-    "agent_s", "agent_status",
+    "runtime_status",
 }
 
 PROBE = "selftest 123 — Lý Thái Tổ"
@@ -90,8 +90,8 @@ async def main() -> int:
                 f"{len(tools)} tools" + (f"; missing: {', '.join(missing)}" if missing else ""),
             )
 
-            status, _ = await call(session, "agent_status")
-            record("agent_status", '"session_token": "active"' in status)
+            status, _ = await call(session, "runtime_status")
+            record("runtime_status", '"session_token": "active"' in status)
 
             info, _ = await call(session, "screen_info")
             record("screen_info", "monitors(" in info, info[:90])

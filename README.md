@@ -31,8 +31,7 @@ then act on them by id/name instead of guessing pixels.
 | `clipboard` | Get / set / paste clipboard text |
 | `list_windows`, `focus_window`, `close_window`, `window_action`, `screen_info` | Window inventory, monitor layout, focus, targeted close (safer than a blind `alt+f4`), and minimize/maximize/restore/move/resize |
 | `wait_for_window`, `wait_for_element`, `wait`, `launch` | Wait for a window/control instead of sleeping; launch apps with arguments and wait for their window |
-| `agent_s` | Optional: hands a whole task to **Agent-S** (autonomous GUI agent) |
-| `agent_status` | What is actually available in the runtime |
+| `runtime_status` | Native readiness: screen/monitors, active window, screenshot mapping, OCR and the launcher lease |
 
 Multi-monitor is handled natively: `screen_info` shows the physical layout
 (`x,y,width,height`; primary first), `screenshot(monitor=0|1|...|-1)` picks a
@@ -42,9 +41,15 @@ display left of or above the primary. `snapshot(window="Title")` and
 `screenshot(window="Title")` target one window. Verified with a 1280x720 primary
 and a 3840x2160 secondary at `(-1341,-2160)`.
 
-`agent_s` is only usable if you provide model credentials and a grounding
-endpoint (see below). Without them, the agent still drives the GUI itself via the
-primitives above — that path needs no extra API keys.
+**OpenCode is the only model in the loop.** There is no second GUI agent, no
+delegated "do this whole task" model and no extra API key. Every tool is
+deterministic native automation; OpenCode decides and calls them. Optional local
+OCR (Tesseract) is text recognition, not another model.
+
+The trade-off is deliberate: a second autonomous GUI agent adds another model,
+a grounding endpoint and key management, and duplicates the planning OpenCode
+already does. Here OpenCode sees the tree/screenshot, chooses the next native
+action and verifies the result — one model, one policy, one audit trail.
 
 ### How this compares with other computer-use servers
 
@@ -101,6 +106,10 @@ runtime entry is location-scoped, so other projects do not receive desktop tools
 For scripted use, set `COMPUTER_USE_PAIR_HOLD_SECONDS=<n>` to detach and clean up
 automatically after `n` seconds.
 
+The paired browser/app is only a client. OpenCode, the MCP server and every tool
+call stay on this PC, scoped to the folder the launcher attaches. The phone or
+remote device needs no Python, no runtime and no computer-use install.
+
 `--remote` exposes the server to the internet (an OpenTunnel URL). Anyone with a
 valid one-time link can control this PC through OpenCode, so treat pairing links
 like passwords. The MCP process also carries a launcher-PID lease: if the window
@@ -112,28 +121,29 @@ Python. On first run the launcher uses the portable OpenCode + `uv` already in
 uv-managed Python 3.12** into `.runtime\tools\python` (~21 MB), builds
 `.runtime\venv`, and installs:
 
-- `mcp` (server SDK), `pyautogui`, `pillow`, `pywinauto` — the GUI primitives
-- **Agent-S** (`gui-agents`): from
-  <https://github.com/simular-ai/Agent-S.git> when Git is present; otherwise the
-  launcher uses the official `gui-agents==0.3.2` PyPI package (same release).
+- `mcp` (server SDK), `pyautogui`, `pillow`, `pywinauto` — the native GUI and UI
+  Automation stack.
 
-The first run therefore needs internet for Python and packages, and OpenCode needs
-internet for models anyway. Later runs reuse the runtime and start quickly.
+No model API key is installed or required. The first run therefore needs internet
+for Python and packages, and OpenCode needs internet for models anyway. Later runs
+reuse the runtime and start quickly.
 
 If you copy the **whole folder including `.runtime`, with `tools\python` and
 `tools\uv-cache` present** (a normal first run by this launcher creates them), the
 first launch at the new path detects that the venv cannot run there and rebuilds it
-from those bundled pieces instead of downloading Python and packages again. Agent-S
-is not preserved by the rebuild and may need reinstalling. Virtual environments are
-path-specific; `.runtime\tools\python` plus `.runtime\tools\uv-cache` are what make
-a copied folder cheap to rebuild. Useful switches:
+from those bundled pieces instead of downloading Python and packages again. Virtual
+environments are path-specific; `.runtime\tools\python` plus
+`.runtime\tools\uv-cache` are what make a copied folder cheap to rebuild. Useful
+switches:
 
 | Switch | Effect |
 | --- | --- |
-| `-NoAgentS` | Skip the heavy Agent-S install (primitives still work) |
 | `-Reinstall` | Wipe and rebuild `.runtime\venv` |
 | `-SelfTest` | Check every primitive (screenshot, clipboard, real Unicode typing into a scratch window the test owns, accessibility snapshot, element actions on a throwaway Run dialog, launch/wait, window list) without launching OpenCode |
 | `-PrepareVendor` | Copy portable OpenCode + uv into `vendor\` (toolchain only; Python and packages are still downloaded on first run) |
+
+An older install that still carries the previous agent packages can reclaim the
+space with `-Reinstall`; the rebuilt venv contains only the native stack.
 
 ## Portable bundle (no npm/Node)
 
@@ -157,12 +167,12 @@ fallback. It then installs packages from PyPI.
 A `.runtime\venv` by itself is path-specific. When the folder is copied, the
 launcher detects a venv that cannot start and rebuilds it. If
 `.runtime\tools\python` and the uv cache came along, the rebuild reuses them;
-otherwise it downloads Python and packages again. Agent-S may need reinstalling
-after a rebuild.
+otherwise it downloads Python and packages again.
 
 Do not commit `.runtime`, `vendor\opencode` or `vendor\uv`; they are ignored.
 
-Approximate sizes: `vendor\` ~320 MB, `.runtime\venv` ~930 MB with Agent-S.
+Approximate sizes: `vendor\` ~320 MB, `.runtime\venv` ~65 MB with only the native
+stack.
 
 `vendor\opencode\opencode.exe` is ~250 MB, so a plain GitHub repo will reject it
 (100 MB file limit). Use Git LFS, or ship the prepared folder as a zip / release
@@ -174,11 +184,10 @@ That means an existing OpenCode/uv install is reused instead of downloading.
 ## Version pinning (no updater)
 
 The launcher is intentionally frozen to a known-good set: **OpenCode 2.3.2**,
-**uv 0.11.28**, **Python 3.12**, and **gui-agents 0.3.2** when Agent-S comes from
-PyPI. There is no update command, no "latest" mode, and no background updater.
-The OpenCode binary, this MCP server, and Agent-S were tested together; silently
-swapping one component is more likely to break the MCP connection than to improve
-the setup.
+**uv 0.11.28**, and **Python 3.12**. There is no update command, no "latest" mode,
+and no background updater. The OpenCode binary and this MCP server were tested
+together; silently swapping one component is more likely to break the MCP
+connection than to improve the setup.
 
 OpenCode still needs internet for models. The launcher's own files can be updated
 separately with `git pull` from
@@ -195,28 +204,12 @@ installation and bypasses the launcher's pins.
 
 ---
 
-## Enabling the autonomous Agent-S path (optional)
+## Optional local OCR
 
-Agent-S needs its own LLM plus a **grounding** model (e.g. UI-TARS served by
-vLLM/TGI). Set these before launching — the launcher passes them through to the
-MCP server:
-
-```powershell
-$env:OPENAI_API_KEY        = "sk-..."        # or ANTHROPIC_API_KEY / GEMINI_API_KEY
-$env:AGENT_S_PROVIDER      = "openai"
-$env:AGENT_S_MODEL         = "gpt-5-2025-08-07"
-$env:AGENT_S_GROUND_URL    = "http://localhost:8080"
-$env:AGENT_S_GROUND_MODEL  = "ui-tars-1.5-7b"
-$env:AGENT_S_GROUNDING_WIDTH  = "1920"
-$env:AGENT_S_GROUNDING_HEIGHT = "1080"
-.\Computer-Use.cmd
-```
-
-Then ask the agent to call `agent_s` with a task, or call it yourself.
-
-Optional extra: install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
-to get text from `screenshot(ocr=true)`. Set `TESSERACT_CMD` if it is not in
-`C:\Program Files\Tesseract-OCR`.
+Install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) to get text
+from `screenshot(ocr=true)`. Set `TESSERACT_CMD` if it is not in
+`C:\Program Files\Tesseract-OCR`. This is local text recognition, not an AI model
+and not required for any other tool.
 
 ---
 
@@ -244,7 +237,7 @@ MCP server also receives `COMPUTER_USE_PARENT_PID`; if the launcher disappears,
 its lease fails and the server refuses tool calls (and exits on its own).
 
 So: no global grant, no always-on listener while the launcher is closed, and no
-background agent after detach.
+background process after detach.
 
 ---
 
@@ -256,8 +249,8 @@ background agent after detach.
   still a real action. Read the target name before clicking something destructive.
 - Prefer `snapshot`/`click_element`/`set_element_text` over blind pixel clicks.
   When an app exposes no accessibility tree, fall back to a screenshot.
-- Agent-S (and the `agent_s` tool) can run arbitrary GUI actions and optionally
-  local code; treat it like handing someone your desktop.
+- The server can run arbitrary GUI actions as your user; treat every session like
+  handing someone your desktop.
 - `ui_tree`, `screenshot` and clipboard reads expose whatever is on screen or in
   your clipboard to the model you are chatting with.
 - Use it on a machine you control, and watch the first few runs.
@@ -276,7 +269,6 @@ background agent after detach.
 | `pair` says a `computer` server already exists | Close the other Computer-Use window, or run `opencode service restart` to clear a stale runtime entry, then retry |
 | Pair mode window was force-closed | The MCP lease makes the old server inert. Relaunch `pair`; if the service still lists a stale entry, run `opencode service restart` |
 | `Refusing to start: no active launcher session` | Start through `Computer-Use.cmd`; that message means the server was run outside the launcher |
-| Agent-S install failed | Primitives still work. The launcher falls back to the PyPI `gui-agents==0.3.2` package when Git is missing. Retry `.\Computer-Use.cmd -Reinstall`, or use `-NoAgentS` |
 | Clicks land slightly off | Screenshots are scaled; always click using coordinates from the most recent `screenshot`, and capture the monitor that holds the target window |
 | `snapshot`/`ui_tree` shows no controls | That app exposes no useful UI Automation tree (some games, some Tk/Electron builds). Use `screenshot` + `click`/`type_text` instead |
 | `snapshot`/`ui_tree` is slow or hangs | One control's accessibility provider is stalling. Retry with a smaller `max_items`, target the exact window, or use `screenshot` for that app |
@@ -286,25 +278,23 @@ background agent after detach.
 | `focus_window` says Windows kept another window in front | Retries and the AttachThreadInput workaround are already applied; if it still fails, click the window once by hand. Windows also forbids a background app from stealing focus from a foreground one |
 | Clipboard says "another app is holding it" | A clipboard manager is mid-write; the tool retries, then falls back to PowerShell. Try again |
 | A window is missing from `list_windows` | It is filtered only when it has no title or zero area. Look for the `[off-screen]` marker — `focus_window` moves such a window back onto the primary display |
-| `agent_s` unicode / encoding noise | Harmless Python or console warnings; check `.runtime\logs\` |
 | Need a clean slate | Delete `.runtime\` and run again (keeps `vendor\`) |
 
-Logs from the MCP server sessions land in `.runtime\logs\sessions.log`, and
-Agent-S task logs in `.runtime\logs\agent-s-*.log`.
+Logs from the MCP server sessions land in `.runtime\logs\sessions.log`.
 
 ## Files
 
 ```text
 Computer-Use.cmd              <- double-click this (session-only launcher)
 scripts\Start-ComputerUse.ps1 <- bootstrap: portable tools, runtime, token, launch
-scripts\computer_use_mcp.py   <- the computer-use MCP server (29 tools)
+scripts\computer_use_mcp.py   <- the computer-use MCP server (28 tools)
 scripts\selftest.py           <- -SelfTest implementation
 scripts\scratch_editor.py     <- throwaway Tk window the self-test types into
 vendor\opencode\opencode.exe  <- portable OpenCode (compiled binary, embedded Bun)
 vendor\uv\uv.exe              <- portable uv (fetches Python/packages unless bundled)
 .runtime\tools                <- private Python + downloaded tool/uv cache
-.runtime\venv                 <- isolated venv (Agent-S lives here)
-.runtime\logs                 <- session + Agent-S logs
+.runtime\venv                 <- isolated venv (native MCP dependencies)
+.runtime\logs                 <- session logs
 ```
 
 The vendored OpenCode binary is MIT-licensed and unmodified; version pins are the

@@ -10,16 +10,16 @@
       1. Finds OpenCode (vendor\ -> .runtime\tools\ -> PATH) or downloads the
          official Windows binary once.
       2. Finds uv the same way, then uses it to build .runtime\venv and install
-         Agent-S (gui-agents) from Git, with a PyPI fallback when Git is absent.
+         the native MCP dependencies.
       3. Starts the local computer-use MCP server as a child of OpenCode and
          injects it through OPENCODE_CONFIG_CONTENT for this process only.
 
+    OpenCode is the only model in the loop: the tool surface is deterministic
+    native automation (UI Automation, screen, mouse, keyboard), with no second
+    GUI agent and no extra API keys.
+
     Nothing is written to your global OpenCode config, PATH, or any machine-wide
     location. When OpenCode exits, the ability is gone.
-
-.PARAMETER NoAgentS
-    Skip installing Agent-S (gui-agents). Screen, mouse, keyboard, windows, UIA and
-    clipboard tools still work.
 
 .PARAMETER Reinstall
     Delete and rebuild .runtime\venv from scratch.
@@ -50,7 +50,6 @@
 #>
 [CmdletBinding()]
 param(
-    [switch]$NoAgentS,
     [switch]$Reinstall,
     [switch]$SelfTest,
     [switch]$PrepareVendor,
@@ -68,7 +67,6 @@ $script:Venv = Join-Path $script:Runtime "venv"
 $script:VenvPy = Join-Path $script:Venv "Scripts\python.exe"
 $script:ServerScript = Join-Path $PSScriptRoot "computer_use_mcp.py"
 $script:LogDir = Join-Path $script:Runtime "logs"
-$script:AgentSRepo = "git+https://github.com/simular-ai/Agent-S.git"
 # Pinned toolchain. There is intentionally no update command; change these only
 # when you are prepared to re-test the whole stack.
 $script:OpenCodeVersion = "2.3.2"
@@ -386,7 +384,7 @@ if ($PrepareVendor) {
     Write-Ok "vendor\ toolchain is ready ($bundleSize MB)."
     Write-Step "On another PC the first run still downloads Python and packages (OpenCode needs internet anyway)."
     Write-Step "If you also copy .runtime, its bundled Python/uv cache lets the venv rebuild without re-downloading."
-    Write-Step "That rebuild restores the core tools; Agent-S may need to be reinstalled."
+    Write-Step "That rebuild restores the native tools."
     exit 0
 }
 
@@ -457,44 +455,6 @@ if (-not $runtimeUsable) {
     Install-Packages -Packages @("mcp>=1.10,<2", "pyautogui", "pillow", "pywinauto") -Label "Repairing MCP server dependencies..."
     if (-not (Test-Runtime)) {
         Fail "The isolated runtime cannot import mcp/pyautogui/Pillow/pywinauto."
-    }
-}
-
-$script:AgentS = Join-Path $script:Venv "Scripts\agent_s.exe"
-if (-not $NoAgentS) {
-    if (-not (Test-Path $script:AgentS)) {
-        $installed = $false
-        $git = Get-Command git -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($git) {
-            Write-Step "Installing Agent-S (gui-agents) from $script:AgentSRepo"
-            Write-Step "First run only - this pulls paddle/ocr/selenium dependencies and can take a few minutes."
-            try {
-                Install-Packages -Packages @($script:AgentSRepo) -Label "Installing Agent-S..."
-                $installed = Test-Path $script:AgentS
-            } catch {
-                Write-Warn "Agent-S git install failed: $($_.Exception.Message)"
-            }
-        } else {
-            Write-Step "Git was not found; installing the official gui-agents package from PyPI instead."
-        }
-
-        # A fresh PC may not have Git. The official PyPI package is the same
-        # Agent-S release (gui-agents 0.3.2) and avoids a Git dependency.
-        if (-not $installed) {
-            try {
-                Install-Packages -Packages @("gui-agents==0.3.2") -Label "Installing Agent-S from PyPI..."
-                $installed = Test-Path $script:AgentS
-            } catch {
-                Write-Warn "Agent-S PyPI install failed: $($_.Exception.Message)"
-            }
-        }
-
-        if (-not $installed) {
-            Write-Warn "Agent-S was not installed. GUI primitives still work."
-            Write-Warn "Retry with network access, or run with -NoAgentS to skip this step."
-        }
-    } else {
-        Write-Step "Agent-S already present in the runtime."
     }
 }
 
@@ -762,8 +722,7 @@ $env:COMPUTER_USE_SESSION_TOKEN = $token
 $env:OPENCODE_CONFIG_CONTENT = $configJson
 
 # ------------------------------------------------------------------- launching
-$mode = if (Test-Path $script:AgentS) { "screen/mouse/keyboard + Agent-S" } else { "screen/mouse/keyboard only" }
-Write-Ok "Computer use attached for this session ($mode)."
+Write-Ok "Native computer use attached for this session (UI Automation + screen/mouse/keyboard)."
 Write-Step "Session token: $($token.Substring(0, 8))... (dies with this process)"
 Write-Step "No global config was modified. Ctrl+C / exit OpenCode to detach."
 
