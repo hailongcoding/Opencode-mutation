@@ -23,10 +23,12 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from ctypes import wintypes
 
 SESSION_ENV = "COMPUTER_USE_SESSION_TOKEN"
+PARENT_ENV = "COMPUTER_USE_PARENT_PID"
 
 if not os.environ.get(SESSION_ENV):
     sys.stderr.write(
@@ -36,6 +38,50 @@ if not os.environ.get(SESSION_ENV):
     raise SystemExit(2)
 
 IS_WINDOWS = platform.system() == "Windows"
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether a process is still running, without needing psutil."""
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _parent_alive() -> bool:
+    """A launcher-owned session dies with the launcher, even if a service outlives it."""
+    raw = os.environ.get(PARENT_ENV)
+    if not raw:
+        return True
+    try:
+        return _process_alive(int(raw))
+    except ValueError:
+        return True
+
+
+if not _parent_alive():
+    sys.stderr.write(
+        "[computer-use] Refusing to start: the launcher process is no longer running.\n"
+        "[computer-use] Start 'Computer-Use.cmd' again for a new session.\n"
+    )
+    raise SystemExit(2)
 
 # --------------------------------------------------------------------------
 # Platform setup
@@ -70,6 +116,12 @@ _shot: dict | None = None
 def _safe(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        if not _parent_alive():
+            _release_held()
+            return (
+                "DETACHED: the Computer-Use launcher that created this session is no longer running. "
+                "Start Computer-Use.cmd again for a new session."
+            )
         try:
             return fn(*args, **kwargs)
         except pyautogui.FailSafeException:
@@ -320,6 +372,43 @@ def _release_held() -> None:
 
 
 atexit.register(_release_held)
+
+
+def _log_event(message: str) -> None:
+    """Append a diagnostic line to .runtime/logs/sessions.log."""
+    try:
+        log_dir = os.path.join(ROOT, ".runtime", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        token = os.environ.get(SESSION_ENV, "")[:8]
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(log_dir, "sessions.log"), "a", encoding="utf-8") as handle:
+            handle.write(f"{stamp}  {message}  session={token}  pid={os.getpid()}\n")
+    except Exception:
+        pass
+
+
+def _start_parent_watchdog() -> None:
+    """Exit if the launcher disappears, even when the service outlives it."""
+    lease = os.environ.get(PARENT_ENV)
+    if not lease:
+        return
+    _log_event(f"lease armed  launcher={lease}")
+
+    def watch() -> None:
+        while True:
+            time.sleep(2.0)
+            if _parent_alive():
+                continue
+            try:
+                _log_event(f"lease expired  launcher={lease}")
+                _release_held()
+            finally:
+                os._exit(0)
+
+    threading.Thread(target=watch, name="computer-use-parent-watch", daemon=True).start()
+
+
+_start_parent_watchdog()
 
 
 # --------------------------------------------------------------------------
@@ -1878,15 +1967,8 @@ def agent_status() -> str:
 
 def _log_startup() -> None:
     """Append a line to .runtime/logs/sessions.log so the launcher can be verified."""
-    try:
-        log_dir = os.path.join(ROOT, ".runtime", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        token = os.environ.get(SESSION_ENV, "")[:8]
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(os.path.join(log_dir, "sessions.log"), "a", encoding="utf-8") as handle:
-            handle.write(f"{stamp}  started  session={token}  pid={os.getpid()}\n")
-    except Exception:
-        pass
+    lease = os.environ.get(PARENT_ENV, "-")
+    _log_event(f"started  launcher={lease}")
 
 
 if __name__ == "__main__":

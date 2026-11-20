@@ -43,6 +43,10 @@
     .\Computer-Use.cmd --prompt "Open notepad and type hello"
 .EXAMPLE
     .\Computer-Use.cmd -SelfTest
+.EXAMPLE
+    .\Computer-Use.cmd pair
+.EXAMPLE
+    .\Computer-Use.cmd pair --remote
 #>
 [CmdletBinding()]
 param(
@@ -110,6 +114,49 @@ function Invoke-External {
     }
     $script:LastExitCode = $LASTEXITCODE
     if ($null -eq $script:LastExitCode) { $script:LastExitCode = 0 }
+}
+
+# Captures stdout from an OpenCode subcommand. Never used for the TUI: pairing
+# and service discovery need the text, while the TUI needs the real console.
+function Invoke-OpenCodeCapture {
+    param([string[]]$Arguments)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $script:OpenCode @Arguments 2>$null
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($null -eq $code) { $code = 0 }
+    $script:LastExitCode = $code
+    return [pscustomobject]@{
+        Output   = (($output | ForEach-Object { [string]$_ }) -join "`n").Trim()
+        ExitCode = $code
+    }
+}
+
+# Small wrapper so every runtime service call uses the same timeout and JSON
+# handling. The background service listens on loopback and uses Basic auth.
+function Invoke-ServiceHttp {
+    param(
+        [string]$Method,
+        [string]$Uri,
+        [hashtable]$Headers,
+        [string]$Body
+    )
+    $request = @{
+        Uri             = $Uri
+        Method          = $Method
+        Headers         = $Headers
+        UseBasicParsing = $true
+        TimeoutSec      = 30
+    }
+    if ($Body) {
+        $request.ContentType = "application/json"
+        $request.Body = $Body
+    }
+    Invoke-WebRequest @request
 }
 
 # --------------------------------------------------------------- tool helpers
@@ -470,10 +517,223 @@ $serverEntry = [ordered]@{
     type        = "local"
     command     = @($script:VenvPy, $script:ServerScript)
     cwd         = $script:Root
-    environment = [ordered]@{ COMPUTER_USE_SESSION_TOKEN = $token }
+    environment = [ordered]@{
+        COMPUTER_USE_SESSION_TOKEN = $token
+        COMPUTER_USE_PARENT_PID    = "$PID"
+    }
     timeout     = [ordered]@{ startup = 120000; catalog = 60000 }
 }
 
+$runDirectory = $script:Root
+if ($Directory) {
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        Fail "Directory not found: $Directory"
+    }
+    $runDirectory = (Resolve-Path -LiteralPath $Directory).Path
+}
+
+# `pair` must be the first argument. Only checking the first token keeps a
+# flag value (for example `--prompt pair`) from being treated as the subcommand.
+$pairMode = ($OpenCodeArgs.Count -gt 0 -and $OpenCodeArgs[0] -ieq "pair")
+
+# ------------------------------------------------------------------ pair mode
+# `opencode pair` needs the shared background service and rejects --standalone.
+# Attach the MCP server to that service at runtime, only for the launch folder.
+if ($pairMode) {
+    $pairHelp = $false
+    foreach ($argument in $OpenCodeArgs) {
+        if ($argument -in @("--help", "-h", "--version", "-v")) { $pairHelp = $true }
+    }
+
+    Write-Host ""
+    Write-Step "Pair mode uses OpenCode's background service (not --standalone)."
+    Write-Step "Computer use will be added for this folder only: $runDirectory"
+
+    $serviceWasRunning = $false
+    $before = Invoke-OpenCodeCapture @("service", "status")
+    if ($before.ExitCode -eq 0 -and $before.Output -match '^https?://') {
+        $serviceWasRunning = $true
+    }
+
+    $pairExit = 1
+    $runtimeAttached = $false
+    $startedService = $false
+    $serviceUrl = $null
+    $mcpUri = $null
+    $headers = $null
+
+    # `opencode pair` starts or reuses the shared background service. If this
+    # launcher was itself started from another Computer-Use window, its inline
+    # config and token would be inherited by that service and register a second
+    # `computer` server for every project. Pair mode manages the runtime entry
+    # itself, so drop those launcher-only variables first.
+    Remove-Item Env:\OPENCODE_CONFIG_CONTENT -ErrorAction SilentlyContinue
+    Remove-Item Env:\COMPUTER_USE_SESSION_TOKEN -ErrorAction SilentlyContinue
+    Remove-Item Env:\COMPUTER_USE_PARENT_PID -ErrorAction SilentlyContinue
+
+    Push-Location $runDirectory
+    try {
+        Invoke-External { & $script:OpenCode @OpenCodeArgs }
+        $pairExit = $script:LastExitCode
+
+        if ($pairExit -ne 0) {
+            Write-Warn "OpenCode pairing exited with code $pairExit."
+        } elseif ($pairHelp) {
+            # `pair --help` never starts the service or issues a code.
+        } else {
+            $status = Invoke-OpenCodeCapture @("service", "status")
+            if ($status.ExitCode -ne 0 -or $status.Output -notmatch '^https?://') {
+                Write-Warn "Pairing finished, but the background service was not found."
+                $pairExit = 1
+            } else {
+                $serviceUrl = $status.Output.TrimEnd('/')
+                $startedService = (-not $serviceWasRunning)
+
+                $password = (Invoke-OpenCodeCapture @("service", "get", "password")).Output
+                if (-not $password) {
+                    Write-Warn "Could not read the background service password."
+                    $pairExit = 1
+                } else {
+                    $basic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("opencode:$password"))
+                    $headers = @{ Authorization = "Basic $basic" }
+                    $query = "location%5Bdirectory%5D=" + [Uri]::EscapeDataString($runDirectory)
+                    $mcpUri = "$serviceUrl/api/experimental/mcp/computer?$query"
+
+                    # Do not hijack an existing `computer` server (for example a
+                    # different Computer-Use window that is still attached).
+                    $existing = $null
+                    try {
+                        $list = Invoke-ServiceHttp -Method "Get" -Uri "$serviceUrl/api/mcp?$query" -Headers $headers
+                        $parsed = $list.Content | ConvertFrom-Json
+                        $existing = @($parsed.data) | Where-Object { $_.name -eq "computer" } | Select-Object -First 1
+                    } catch {
+                        Write-Step "Could not inspect existing MCP servers: $($_.Exception.Message)"
+                    }
+
+                    if ($existing) {
+                        Write-Warn "A 'computer' MCP server is already registered for this folder (status: $($existing.status.status))."
+                        Write-Step "Close the other Computer-Use window, or run 'opencode service restart' to clear a stale entry."
+                        $pairExit = 1
+                    } else {
+                        $payload = [ordered]@{
+                            config = [ordered]@{
+                                type        = "local"
+                                command     = @($script:VenvPy, $script:ServerScript)
+                                cwd         = $script:Root
+                                environment = [ordered]@{
+                                    COMPUTER_USE_SESSION_TOKEN = $token
+                                    COMPUTER_USE_PARENT_PID    = "$PID"
+                                }
+                                timeout     = [ordered]@{ startup = 120000; catalog = 60000 }
+                            }
+                        } | ConvertTo-Json -Depth 20 -Compress
+
+                        for ($attempt = 1; $attempt -le 8; $attempt++) {
+                            try {
+                                $response = Invoke-ServiceHttp -Method "Put" -Uri $mcpUri -Headers $headers -Body $payload
+                                if ($response.StatusCode -eq 204 -or $response.StatusCode -eq 200) {
+                                    $runtimeAttached = $true
+                                    break
+                                }
+                            } catch {
+                                if ($attempt -eq 8) {
+                                    Write-Warn "Could not attach computer use: $($_.Exception.Message)"
+                                } else {
+                                    Start-Sleep -Milliseconds 500
+                                }
+                            }
+                        }
+
+                        if (-not $runtimeAttached) {
+                            $pairExit = 1
+                        } else {
+                            # Give the local MCP server time to finish starting so
+                            # the first tool call from the paired app does not race it.
+                            $ready = $false
+                            for ($attempt = 0; $attempt -lt 40; $attempt++) {
+                                try {
+                                    $current = Invoke-ServiceHttp -Method "Get" -Uri "$serviceUrl/api/mcp?$query" -Headers $headers
+                                    $parsed = $current.Content | ConvertFrom-Json
+                                    $entry = @($parsed.data) | Where-Object { $_.name -eq "computer" } | Select-Object -First 1
+                                    if ($entry -and $entry.status.status -eq "connected") {
+                                        $ready = $true
+                                        break
+                                    }
+                                    if ($entry -and $entry.status.status -eq "failed") { break }
+                                } catch { }
+                                Start-Sleep -Milliseconds 500
+                            }
+
+                            Write-Host ""
+                            if ($ready) {
+                                Write-Ok "Computer use is attached to the background service."
+                            } else {
+                                Write-Warn "Computer use was added but has not reported 'connected' yet."
+                                Write-Step "The paired session can retry once the MCP server finishes starting."
+                            }
+                            Write-Step "Background service: $serviceUrl"
+                            Write-Step "In the paired app, open this folder as the project: $runDirectory"
+                            Write-Step "The pairing links above are one-time and expire after five minutes."
+                            Write-Step "Keep this window open while the paired app is in use."
+
+                            $holdSeconds = 0
+                            [void][int]::TryParse($env:COMPUTER_USE_PAIR_HOLD_SECONDS, [ref]$holdSeconds)
+                            if ($holdSeconds -gt 0) {
+                                Write-Step "Auto-detaching after $holdSeconds seconds (COMPUTER_USE_PAIR_HOLD_SECONDS)."
+                                Start-Sleep -Seconds $holdSeconds
+                            } elseif ([Console]::IsInputRedirected) {
+                                Write-Step "Input is not interactive: keep this process running; press Ctrl+C to detach."
+                                while ($true) { Start-Sleep -Seconds 60 }
+                            } else {
+                                Write-Step "Press Enter here to detach and clean up."
+                                [void][Console]::ReadLine()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } finally {
+        Pop-Location
+
+        if ($runtimeAttached -and $mcpUri -and $headers) {
+            $removed = $false
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+                try {
+                    $null = Invoke-ServiceHttp -Method "Delete" -Uri $mcpUri -Headers $headers
+                    $removed = $true
+                    break
+                } catch {
+                    Start-Sleep -Milliseconds 400
+                }
+            }
+            if ($removed) {
+                Write-Step "Removed the runtime computer-use server from the background service."
+            } else {
+                Write-Warn "Could not remove the runtime computer-use server; it is inert once this window closes."
+            }
+        }
+
+        if ($startedService) {
+            $after = Invoke-OpenCodeCapture @("service", "status")
+            if ($after.ExitCode -eq 0 -and $after.Output -match '^https?://') {
+                $null = Invoke-OpenCodeCapture @("service", "stop")
+                Write-Step "Stopped the background service this launcher started."
+            }
+        }
+
+        Write-Host ""
+        if ($pairExit -eq 0) {
+            Write-Host "  Pairing detached. The computer-use tools are no longer attached." -ForegroundColor Cyan
+        } else {
+            Write-Host "  Pairing ended with code $pairExit. Nothing was left attached." -ForegroundColor Yellow
+        }
+    }
+
+    exit $pairExit
+}
+
+# ------------------------------------------------------------ normal launch
 # Merge over any inline config the user already had; nothing is written to disk.
 $configJson = $null
 if ($env:OPENCODE_CONFIG_CONTENT) {
@@ -512,7 +772,6 @@ if ($Directory) { $arguments += $Directory }
 if ($OpenCodeArgs) { $arguments += $OpenCodeArgs }
 
 $exitCode = 1
-$runDirectory = if ($Directory -and (Test-Path $Directory)) { $Directory } else { $script:Root }
 Push-Location $runDirectory
 try {
     Invoke-External { & $script:OpenCode @arguments }

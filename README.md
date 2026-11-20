@@ -73,6 +73,39 @@ moving the pointer where the target app supports it.
 .\Computer-Use.cmd --prompt "Open Notepad and type hello"
 ```
 
+### Pair a phone, tablet or remote device
+
+`opencode pair` needs OpenCode's shared background service, so pair mode cannot
+use the normal private `--standalone` launch:
+
+```powershell
+.\Computer-Use.cmd pair                 # local / LAN links
+.\Computer-Use.cmd pair --remote        # public OpenTunnel link (asks first)
+.\Computer-Use.cmd pair --remote --yes  # accept the exposure without prompting
+.\Computer-Use.cmd pair --remote -Directory C:\Users\Admin\projects\demo
+```
+
+In pair mode the launcher:
+
+1. runs `opencode pair` with your flags (no `--standalone`, which pair rejects);
+2. adds the `computer` MCP server to that background service at runtime, scoped
+   to the launch folder;
+3. waits for the MCP server to report `connected`, then keeps the window open;
+4. on Enter/exit removes the runtime entry again, and stops the background
+   service **only** if this launcher started it.
+
+Keep the launcher window open while the paired device is in use. The one-time
+pairing links expire after five minutes, but the tools stay attached while that
+window is open. In the paired app, choose the **same folder** as the project; the
+runtime entry is location-scoped, so other projects do not receive desktop tools.
+For scripted use, set `COMPUTER_USE_PAIR_HOLD_SECONDS=<n>` to detach and clean up
+automatically after `n` seconds.
+
+`--remote` exposes the server to the internet (an OpenTunnel URL). Anyone with a
+valid one-time link can control this PC through OpenCode, so treat pairing links
+like passwords. The MCP process also carries a launcher-PID lease: if the window
+is force-closed, it exits and refuses further tool calls instead of staying live.
+
 **Nothing needs to be installed first** — no Node, no npm, no Bun, and no system
 Python. On first run the launcher uses the portable OpenCode + `uv` already in
 `vendor\` (or downloads them, ~150 MB, checksum-verified), downloads a **private
@@ -202,7 +235,16 @@ to get text from `screenshot(ocr=true)`. Set `TESSERACT_CMD` if it is not in
    session data under your user profile — normal OpenCode behavior, not a global
    MCP grant.
 
-So: no global grant, no always-on listener, no background agent.
+**Pair mode is the one exception.** `opencode pair` rejects `--standalone` and
+requires the shared background service. There the launcher does not inject
+`OPENCODE_CONFIG_CONTENT`; it lets `opencode pair` ensure the service, then adds
+`computer` through the runtime MCP API for the launch folder only. On exit it
+deletes that entry and stops the service only if this launcher started it. The
+MCP server also receives `COMPUTER_USE_PARENT_PID`; if the launcher disappears,
+its lease fails and the server refuses tool calls (and exits on its own).
+
+So: no global grant, no always-on listener while the launcher is closed, and no
+background agent after detach.
 
 ---
 
@@ -230,6 +272,9 @@ So: no global grant, no always-on listener, no background agent.
 | `checksum mismatch` | A proxy or antivirus modified the download. Retry the launcher; if it repeats, check the proxy/antivirus |
 | OpenCode starts but shows `0 MCP` | Give it a few seconds; if it stays 0, check `.runtime\logs\sessions.log` and the OpenCode log (`~/.local/share/opencode/log/opencode.log`) |
 | No `computer` tools in the session | Exit OpenCode fully, relaunch via `Computer-Use.cmd` (not `opencode` directly) |
+| Paired app shows no `computer` tools | In the paired app, open the **same folder** the launcher printed. Runtime MCP entries are location-scoped, so another project has no tools |
+| `pair` says a `computer` server already exists | Close the other Computer-Use window, or run `opencode service restart` to clear a stale runtime entry, then retry |
+| Pair mode window was force-closed | The MCP lease makes the old server inert. Relaunch `pair`; if the service still lists a stale entry, run `opencode service restart` |
 | `Refusing to start: no active launcher session` | Start through `Computer-Use.cmd`; that message means the server was run outside the launcher |
 | Agent-S install failed | Primitives still work. The launcher falls back to the PyPI `gui-agents==0.3.2` package when Git is missing. Retry `.\Computer-Use.cmd -Reinstall`, or use `-NoAgentS` |
 | Clicks land slightly off | Screenshots are scaled; always click using coordinates from the most recent `screenshot`, and capture the monitor that holds the target window |
