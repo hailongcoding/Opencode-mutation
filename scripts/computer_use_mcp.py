@@ -667,6 +667,21 @@ def _list_windows() -> list[dict]:
     return found
 
 
+def _rank_title_matches(matches: list[dict], needle: str) -> list[dict]:
+    """Best title match first: exact, prefix, substring; then active, then shortest."""
+    def rank(window: dict) -> tuple:
+        title = window["title"].lstrip("* ").lower()
+        if title == needle:
+            tier = 0
+        elif title.startswith(needle):
+            tier = 1
+        else:
+            tier = 2
+        return (tier, not window["active"], len(window["title"]))
+
+    return sorted(matches, key=rank)
+
+
 def _force_foreground(hwnd: int) -> bool:
     """SetForegroundWindow refuses in many cases; use the AttachThreadInput workaround."""
     u = _user32()
@@ -743,23 +758,13 @@ def _focus_hwnd(
 def _focus_window(substring: str) -> tuple[bool, str]:
     if not IS_WINDOWS:
         return False, "window focus is only implemented on Windows"
-    needle = substring.strip().lower()
+    needle = (substring or "").strip().lower()
+    if not needle:
+        return False, "title must not be empty"
     matches = [w for w in _list_windows() if needle in w["title"].lower()]
     if not matches:
         return False, f"no visible window title contains {substring!r}"
-
-    def rank(window: dict) -> tuple:
-        title = window["title"].lstrip("* ").lower()
-        if title == needle:
-            tier = 0
-        elif title.startswith(needle):
-            tier = 1
-        else:
-            tier = 2
-        return (tier, len(window["title"]))
-
-    matches.sort(key=rank)
-    target = matches[0]
+    target = _rank_title_matches(matches, needle)[0]
     return _focus_hwnd(
         target["hwnd"], target["title"], target["offscreen"], target["minimized"]
     )
@@ -795,14 +800,7 @@ def _pick_window(substring: str = "") -> dict | None:
         matches = [w for w in windows if needle in w["title"].lower()]
         if not matches:
             return None
-
-        def rank(window: dict) -> tuple:
-            title = window["title"].lstrip("* ").lower()
-            tier = 0 if title == needle else 1 if title.startswith(needle) else 2
-            return (tier, len(window["title"]))
-
-        matches.sort(key=rank)
-        return matches[0]
+        return _rank_title_matches(matches, needle)[0]
     active = int(_user32().GetForegroundWindow() or 0)
     for window in windows:
         if window["hwnd"] == active:
@@ -943,6 +941,16 @@ def _resolve_element(
         item = _UI_CACHE["items"].get(needle.lower())
         if item is None:
             return None, f"unknown element id {needle!r}; take a snapshot/ui_tree first"
+        if window.strip():
+            requested = _pick_window(window)
+            if requested is None:
+                return None, f"no visible window matching {window!r}"
+            if item["hwnd"] != requested["hwnd"]:
+                return None, (
+                    f"element {needle!r} belongs to {item['window']!r}, not "
+                    f"{requested['title']!r}; take a snapshot/ui_tree of the requested "
+                    "window first"
+                )
         # An id resolves to the exact cached control, never to a re-numbered one.
         return item, ""
 
@@ -1239,8 +1247,19 @@ def drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5, button: str 
     """Press at (x1,y1), drag to (x2,y2), release. All in screenshot pixel space."""
     s1 = _to_screen(x1, y1)
     s2 = _to_screen(x2, y2)
+    button = button if button in {"left", "right", "middle"} else "left"
     pyautogui.moveTo(*s1, duration=0.15)
-    pyautogui.dragTo(*s2, duration=max(0.1, min(float(duration), 3.0)), button=button)
+    _HELD_MOUSE.add(button)
+    try:
+        pyautogui.mouseDown(button=button)
+        time.sleep(0.1)
+        pyautogui.moveTo(*s2, duration=max(0.1, min(float(duration), 3.0)))
+        time.sleep(0.1)
+    finally:
+        try:
+            pyautogui.mouseUp(button=button)
+        finally:
+            _HELD_MOUSE.discard(button)
     time.sleep(0.2)
     return f"dragged {s1} -> {s2}"
 
@@ -1493,11 +1512,13 @@ WM_CLOSE = 0x0010
 def _close_window(substring: str, wait: float = 1.5) -> tuple[bool, str]:
     if not IS_WINDOWS:
         return False, "window closing is only implemented on Windows"
-    needle = substring.strip().lower()
+    needle = (substring or "").strip().lower()
+    if not needle:
+        return False, "title must not be empty"
     matches = [w for w in _list_windows() if needle in w["title"].lower()]
     if not matches:
         return False, f"no visible window title contains {substring!r}"
-    target = matches[0]
+    target = _rank_title_matches(matches, needle)[0]
     u = _user32()
     u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     u.PostMessageW.restype = wintypes.BOOL
@@ -1566,6 +1587,7 @@ def launch(
     Without wait_for, waits `wait` seconds and tries to focus the new window.
     """
     before = _active_window_title()
+    before_hwnds = {w["hwnd"] for w in _list_windows()}
     detach = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -1585,15 +1607,33 @@ def launch(
 
     if wait_for.strip():
         needle = wait_for.strip().lower()
-        deadline = time.monotonic() + max(0.2, min(float(timeout), 120.0))
+        start = time.monotonic()
+        deadline = start + max(0.2, min(float(timeout), 120.0))
+        fallback: dict | None = None
         while time.monotonic() < deadline:
-            for window in _list_windows():
-                if needle in window["title"].lower():
+            matches = [w for w in _list_windows() if needle in w["title"].lower()]
+            if matches:
+                ranked = _rank_title_matches(matches, needle)
+                new = [w for w in ranked if w["hwnd"] not in before_hwnds]
+                if new:
+                    window = new[0]
                     return (
-                        f"launched {target!r}; window appeared: {window['title']!r} "
-                        f"hwnd={window['hwnd']} rect={window['rect']}"
+                        f"launched {target!r}; new window appeared: "
+                        f"{window['title']!r} hwnd={window['hwnd']} rect={window['rect']}"
+                    )
+                fallback = fallback or ranked[0]
+                # A single-instance app reuses its old window instead of creating one.
+                if time.monotonic() - start >= min(2.0, float(timeout)):
+                    return (
+                        f"launched {target!r}; existing window matched (no new window "
+                        f"appeared): {fallback['title']!r} hwnd={fallback['hwnd']}"
                     )
             time.sleep(0.25)
+        if fallback:
+            return (
+                f"launched {target!r}; existing window matched (no new window appeared): "
+                f"{fallback['title']!r} hwnd={fallback['hwnd']}"
+            )
         visible = ", ".join(w["title"] for w in _list_windows()[:6])
         return (
             f"launched {target!r} but no window title contained {wait_for!r} "
@@ -2063,16 +2103,17 @@ def wait_for_window(title: str, timeout: float = 10.0, state: str = "appear") ->
     seen: dict | None = None
     while True:
         matches = [w for w in _list_windows() if needle in w["title"].lower()]
+        ranked = _rank_title_matches(matches, needle) if matches else []
         elapsed = time.monotonic() - start
-        if state == "appear" and matches:
-            window = matches[0]
+        if state == "appear" and ranked:
+            window = ranked[0]
             return (
                 f"appeared after {elapsed:.1f}s: {window['title']!r} "
                 f"hwnd={window['hwnd']} rect={window['rect']}"
             )
         if state == "close":
-            if matches:
-                seen = matches[0]
+            if ranked:
+                seen = ranked[0]
             else:
                 if seen:
                     return (
@@ -2085,7 +2126,7 @@ def wait_for_window(title: str, timeout: float = 10.0, state: str = "appear") ->
                 )
         if elapsed >= timeout:
             if state == "close":
-                visible = matches[0]["title"] if matches else "(none)"
+                visible = ranked[0]["title"] if ranked else "(none)"
                 return (
                     f"timed out after {timeout:g}s waiting for {title!r} to close; "
                     f"still visible: {visible}"
@@ -2208,12 +2249,33 @@ def window_action(
     action = (action or "activate").strip().lower()
 
     if action in {"activate", "focus"}:
-        ok, message = _focus_window(target["title"])
+        ok, message = _focus_hwnd(
+            target["hwnd"], target["title"], target["offscreen"], target["minimized"]
+        )
         return ("ok: " if ok else "failed: ") + message
     if action in {"minimize", "maximize", "restore"}:
         commands = {"minimize": 6, "maximize": 3, "restore": 9}  # SW_MINIMIZE/MAXIMIZE/RESTORE
-        if not u.ShowWindow(hwnd, commands[action]):
-            return f"failed: ShowWindow({action}) returned 0"
+        u.IsIconic.argtypes = [wintypes.HWND]
+        u.IsIconic.restype = wintypes.BOOL
+        u.IsZoomed.argtypes = [wintypes.HWND]
+        u.IsZoomed.restype = wintypes.BOOL
+        u.ShowWindow(hwnd, commands[action])
+        time.sleep(0.25)
+        # ShowWindow returns the previous visibility, not success, so verify state.
+        minimized_now = bool(u.IsIconic(hwnd))
+        maximized_now = bool(u.IsZoomed(hwnd))
+        ok = (
+            (action == "minimize" and minimized_now)
+            or (action == "maximize" and maximized_now)
+            or (action == "restore" and not minimized_now and not maximized_now)
+        )
+        if not ok:
+            state = (
+                "minimized" if minimized_now
+                else "maximized" if maximized_now
+                else "restored"
+            )
+            return f"failed: asked to {action} {target['title']!r} but it is {state}"
     elif action in {"move", "resize", "move_resize"}:
         left, top, current_width, current_height = _window_rect(target["hwnd"])
         # None means "keep current". Do not use -1 as the sentinel: it is a real

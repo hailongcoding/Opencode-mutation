@@ -31,9 +31,9 @@ then act on them by id/name instead of guessing pixels.
 | `press_keys` | Key combos: `ctrl+c`, `alt+f4`, `enter`, `win`, ... |
 | `key_down`, `key_up`, `hold_key`, `mouse_button` | Modifier/mouse holds for custom sequences, selections and drags |
 | `clipboard` | Get / set / paste clipboard text |
-| `list_windows`, `focus_window`, `close_window`, `window_action`, `screen_info` | Window inventory, monitor layout, focus, targeted close (safer than a blind `alt+f4`), and minimize/maximize/restore/move/resize |
+| `list_windows`, `focus_window`, `close_window`, `window_action`, `screen_info` | Window inventory, monitor layout, focus, targeted close (safer than a blind `alt+f4`; exact/active title matches win), and minimize/maximize/restore/move/resize |
 | `wait_for_window`, `wait_for_element` | Wait for a window to appear/close, or an element to appear/close/become enabled/disabled — no fixed sleeps |
-| `wait`, `launch` | Explicit delay when needed; launch apps with arguments and wait for their window |
+| `wait`, `launch` | Explicit delay when needed; launch apps with arguments and wait for the new window (not an older window with the same title) |
 | `runtime_status` | Native readiness: screen/monitors, active window, screenshot mapping, OCR, launcher lease and read-only state |
 
 Multi-monitor is handled natively: `screen_info` shows the physical layout
