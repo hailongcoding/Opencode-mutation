@@ -76,7 +76,11 @@ moving the pointer where the target app supports it.
 # double-click, or from a terminal:
 .\Computer-Use.cmd
 
-# pick a project folder / pass normal opencode flags through:
+# OpenCode opens in the folder you launched from by default:
+cd C:\Users\Admin\projects\demo
+& "C:\path\to\Computer-Use.cmd"
+
+# or pick a different project folder / pass normal opencode flags through:
 .\Computer-Use.cmd -Directory C:\Users\Admin\projects\demo
 .\Computer-Use.cmd --prompt "Open Notepad and type hello"
 ```

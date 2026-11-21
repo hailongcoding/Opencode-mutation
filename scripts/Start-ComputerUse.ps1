@@ -57,8 +57,9 @@
     .\Computer-Use.cmd pair --remote --read-only
 
 .NOTES
-    -Directory <path> selects the OpenCode working folder. It is parsed with the
-    passthrough arguments so that `pair` and other subcommands keep working.
+    OpenCode opens in the folder you launched from by default. -Directory <path>
+    overrides it. -Directory is parsed with the passthrough arguments so that
+    `pair` and other subcommands keep working.
 #>
 [CmdletBinding()]
 param(
@@ -73,6 +74,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Where the user actually invoked the launcher. All launcher internals resolve
+# against $script:Root, but OpenCode's project folder should default to this.
+$startDirectory = (Get-Location).Path
 
 # --read-only is a launcher flag, not an OpenCode flag. -Directory is parsed
 # manually because PowerShell would otherwise bind the `pair` subcommand to it.
@@ -531,7 +536,10 @@ $serverEntry = [ordered]@{
     timeout     = [ordered]@{ startup = 120000; catalog = 60000 }
 }
 
-$runDirectory = $script:Root
+$runDirectory = $startDirectory
+if (-not (Test-Path -LiteralPath $runDirectory -PathType Container)) {
+    $runDirectory = $script:Root
+}
 if ($Directory) {
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
         Fail "Directory not found: $Directory"
@@ -780,6 +788,7 @@ if ($readOnlyMode) {
     Write-Ok "Native computer use attached for this session (UI Automation + screen/mouse/keyboard)."
 }
 Write-Step "Session token: $($token.Substring(0, 8))... (dies with this process)"
+Write-Step "Working folder: $runDirectory"
 Write-Step "No global config was modified. Ctrl+C / exit OpenCode to detach."
 
 $arguments = @("--standalone")
