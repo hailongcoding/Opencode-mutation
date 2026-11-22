@@ -4,12 +4,15 @@ Checks, in order:
   * every tool is registered
   * runtime_status / screen_info answer
   * screenshots come back as images
-  * the clipboard round-trips (accented text, emoji, newlines)
-  * accessibility snapshot returns a tree plus an image
+  * the clipboard round-trips (accented text, emoji, newlines) and is restored
+  * accessibility snapshot returns a tree plus an image, including annotated boxes
   * type_text really delivers Unicode into a scratch editor window (SendInput bug)
   * element invoke + window minimize/restore work on that scratch window
-  * find_elements, modifier clicks, targeted scroll, element drag and wait states
-    work on the throwaway Run dialog (no document, no save prompt, Escape cancels)
+  * element actions run against a throwaway WinForms window with stable English
+    UIA names/automation ids (no localized system dialogs): search, state,
+    selection, tables/grids, menus, file dialog, targeted scroll, scroll-into-view,
+    drag, modifier click, waits and OCR (skipped when Tesseract is absent)
+  * pause blocks actions, release_all works, and the audit log is written
   * press_keys, focus_window and close_window work, leaving no test window behind
   * a read-only server process allows inspection and blocks every action
 """
@@ -41,6 +44,7 @@ from mcp.client.stdio import stdio_client
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SERVER = os.path.join(HERE, "computer_use_mcp.py")
+AUDIT_LOG = os.path.join(ROOT, ".runtime", "logs", "actions.log")
 
 EXPECTED_TOOLS = {
     "screenshot", "screen_info", "click", "move", "drag", "drag_element", "scroll",
@@ -48,7 +52,17 @@ EXPECTED_TOOLS = {
     "clipboard", "list_windows", "focus_window", "close_window", "launch", "wait",
     "ui_tree", "snapshot", "find_elements", "click_element", "invoke_element",
     "set_element_text", "read_element", "wait_for_window", "wait_for_element",
-    "window_action", "runtime_status",
+    "window_action", "runtime_status", "scroll_into_view", "get_element_state",
+    "read_table", "select_element", "menu", "file_dialog", "find_text",
+    "click_text", "highlight_element", "wait_for_idle", "wait_for_change",
+    "pause", "release_all",
+}
+
+# The computer-use grant must not become a shell/git/process-admin grant. The
+# launcher's auto-update is not callable from the model; keep it that way.
+FORBIDDEN_TOOLS = {
+    "git", "shell", "exec", "run_command", "powershell", "cmd", "terminal",
+    "process", "registry", "service",
 }
 
 PROBE = "selftest 123 — Lý Thái Tổ"
@@ -75,6 +89,32 @@ def image_size(reply) -> tuple[int, int] | None:
     return None
 
 
+async def wait_state(path: str, expected: str, timeout: float = 6.0) -> str:
+    """Poll a file the scratch app writes, so UI actions have real ground truth."""
+    deadline = time.monotonic() + timeout
+    text = ""
+    while time.monotonic() < deadline:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError:
+            text = ""
+        if expected in text:
+            return text
+        await asyncio.sleep(0.2)
+    return text
+
+
+def audit_since(offset: int) -> str:
+    """Only inspect records appended by this run, not the user's older history."""
+    try:
+        with open(AUDIT_LOG, encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            return handle.read()
+    except OSError:
+        return ""
+
+
 async def main() -> int:
     env = {**os.environ, "COMPUTER_USE_SESSION_TOKEN": "selftest"}
     env["COMPUTER_USE_READ_ONLY"] = "0"
@@ -84,6 +124,10 @@ async def main() -> int:
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            try:
+                audit_offset = os.path.getsize(AUDIT_LOG)
+            except OSError:
+                audit_offset = 0
             tools = [tool.name for tool in (await session.list_tools()).tools]
             missing = sorted(EXPECTED_TOOLS - set(tools))
             record(
@@ -91,9 +135,27 @@ async def main() -> int:
                 not missing,
                 f"{len(tools)} tools" + (f"; missing: {', '.join(missing)}" if missing else ""),
             )
+            exposed = sorted(FORBIDDEN_TOOLS & set(tools))
+            record(
+                "no shell/git tools exposed",
+                not exposed,
+                "none" if not exposed else f"forbidden: {', '.join(exposed)}",
+            )
 
             status, _ = await call(session, "runtime_status")
             record("runtime_status", '"session_token": "active"' in status)
+            record(
+                "audit log",
+                '"tool": "runtime_status"' in audit_since(audit_offset),
+                AUDIT_LOG,
+            )
+            record(
+                "health check",
+                '"input_desktop": "available"' in status
+                and '"dpi":' in status
+                and '"audit_log":' in status,
+                "desktop/DPI/audit fields present",
+            )
 
             info, _ = await call(session, "screen_info")
             record("screen_info", "monitors(" in info, info[:90])
@@ -141,6 +203,12 @@ async def main() -> int:
             )
 
             # --- clipboard: unicode + emoji + newline round-trip ---------------
+            # Save the user's clipboard first and restore it immediately after the
+            # check: the self-test must not destroy whatever they had copied.
+            original_clipboard, _ = await call(session, "clipboard", action="get")
+            original_text = ""
+            if original_clipboard.startswith("clipboard (") and "\n" in original_clipboard:
+                original_text = original_clipboard.split("\n", 1)[1]
             payload = "line one — Lý 🐉\nline two"
             await call(session, "clipboard", action="set", text=payload)
             got, _ = await call(session, "clipboard", action="get")
@@ -148,6 +216,13 @@ async def main() -> int:
                 "clipboard round-trip",
                 payload in got,
                 repr(got[:60]),
+            )
+            await call(session, "clipboard", action="set", text=original_text)
+            restored, _ = await call(session, "clipboard", action="get")
+            record(
+                "clipboard restored",
+                original_text in restored or not original_text,
+                f"{len(original_text)} chars",
             )
 
             # --- typing: the SendInput struct-size regression -------------------
@@ -258,6 +333,12 @@ async def main() -> int:
                         PROBE in received,
                         repr(received[:60]),
                     )
+                    record(
+                        "audit redacts typed text",
+                        PROBE not in audit_since(audit_offset)
+                        and '"tool": "type_text"' in audit_since(audit_offset),
+                        "typed payload absent from actions.log",
+                    )
 
                     invoked, _ = await call(
                         session, "invoke_element", target="Minimize", window=editor_title
@@ -334,53 +415,54 @@ async def main() -> int:
                 except OSError:
                     pass
 
-            # --- element actions on a throwaway system dialog -------------------
-            # The Run dialog is ideal: a small UIA tree, no document to lose, and
-            # Escape discards it. Nothing is executed here (no Enter is pressed).
-            run_open = False
+            # --- element actions on a throwaway WinForms window -----------------
+            # English control names + AutomationIds make this independent of the
+            # Windows display language (the old Run-dialog test was not).
+            uia_state = os.path.join(
+                tempfile.gettempdir(), f"opencode-uia-{uuid.uuid4().hex[:8]}.txt"
+            )
+            uia_title = f"Computer-use UIA {uuid.uuid4().hex[:6]}"
+            uia_script = os.path.join(HERE, "scratch_uia.ps1")
+            uia_proc = subprocess.Popen(
+                [
+                    "powershell.exe", "-NoProfile", "-STA",
+                    "-ExecutionPolicy", "Bypass", "-File",
+                    uia_script, uia_title, uia_state,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             try:
-                await call(session, "press_keys", keys="win+r")
-                waited, _ = await call(session, "wait_for_window", title="Run", timeout=8)
-                run_open = waited.startswith("appeared after")
-                record("wait_for_window", run_open, waited[:90])
+                uia_waited, _ = await call(
+                    session, "wait_for_window", title=uia_title, timeout=20
+                )
+                uia_open = uia_waited.startswith("appeared after")
+                record("wait_for_window (scratch UIA)", uia_open, uia_waited[:90])
 
-                if run_open:
-                    tree, _ = await call(
-                        session, "snapshot", window="Run", max_items=60, screenshot=False
+                if uia_open:
+                    snap_text, snap_reply = await call(
+                        session, "snapshot", window=uia_title, max_items=120,
+                        screenshot=True, annotate=True,
                     )
-                    has_cancel = any(
-                        "Button" in line and "Cancel" in line for line in tree.splitlines()
-                    )
+                    snap_kinds = [type(block).__name__ for block in snap_reply.content]
                     record(
-                        "snapshot (uia tree)",
-                        "window: 'Run'" in tree and has_cancel,
-                        next(
-                            (line for line in tree.splitlines() if "Cancel" in line),
-                            tree.splitlines()[0][:80] if tree else "no text",
-                        ),
+                        "snapshot (annotated tree + image)",
+                        "Test Button" in snap_text and "ImageContent" in snap_kinds,
+                        snap_text.splitlines()[0][:90] if snap_text else "no text",
                     )
-
-                    found, _ = await call(
-                        session, "wait_for_element", target="Cancel", window="Run", timeout=4
-                    )
-                    record("wait_for_element", found.startswith("found"), found[:90])
 
                     matches, _ = await call(
-                        session, "find_elements", query="Cancel", window="Run"
+                        session, "find_elements", query="Test Button", window=uia_title
                     )
                     record(
-                        "find_elements",
-                        "match(es)" in matches and "Cancel" in matches and "Button" in matches,
+                        "find_elements (scratch UIA)",
+                        "match(es)" in matches and "Test Button" in matches,
                         matches.splitlines()[-1][:90] if matches else "no text",
                     )
 
                     enabled, _ = await call(
-                        session,
-                        "wait_for_element",
-                        target="Cancel",
-                        window="Run",
-                        timeout=3,
-                        state="enabled",
+                        session, "wait_for_element", target="Test Button",
+                        window=uia_title, timeout=4, state="enabled",
                     )
                     record(
                         "wait_for_element (enabled)",
@@ -388,37 +470,128 @@ async def main() -> int:
                         enabled[:90],
                     )
 
-                    scrolled_to, _ = await call(
-                        session, "scroll", amount=1, target="Open:", window="Run"
+                    typed, _ = await call(
+                        session, "set_element_text", target="TestField",
+                        text="hello-uia", window=uia_title,
                     )
                     record(
-                        "scroll (target)",
-                        scrolled_to.startswith("scrolled")
-                        and "Open:" in scrolled_to,
-                        scrolled_to[:90],
+                        "set_element_text (verified)",
+                        typed.startswith("set") and "(verified)" in typed,
+                        typed[:90],
+                    )
+                    read, _ = await call(
+                        session, "read_element", target="TestField", window=uia_title
+                    )
+                    record("read_element", "hello-uia" in read, read[:90])
+
+                    element_state, _ = await call(
+                        session, "get_element_state", target="TestField",
+                        window=uia_title,
+                    )
+                    record(
+                        "get_element_state",
+                        '"value": "hello-uia"' in element_state
+                        and '"enabled": true' in element_state,
+                        element_state.replace("\n", " ")[:110],
+                    )
+
+                    clicked, _ = await call(
+                        session, "click_element", target="TestButton", window=uia_title
+                    )
+                    button_state = await wait_state(uia_state, "button-clicked", 5)
+                    record(
+                        "click_element (scratch UIA)",
+                        clicked.startswith("clicked")
+                        and "button-clicked" in button_state,
+                        clicked[:90],
+                    )
+
+                    invoked, _ = await call(
+                        session, "invoke_element", target="TestCheck", window=uia_title
+                    )
+                    check_state = await wait_state(uia_state, "check:True", 5)
+                    toggled, _ = await call(
+                        session, "get_element_state", target="TestCheck",
+                        window=uia_title,
+                    )
+                    record(
+                        "invoke_element (checkbox)",
+                        invoked.startswith("invoked")
+                        and ("check:True" in check_state or '"checked": true' in toggled),
+                        invoked[:80],
+                    )
+
+                    selected, _ = await call(
+                        session, "select_element", target="TestCombo",
+                        item_text="Beta", window=uia_title,
+                    )
+                    combo_state = await wait_state(uia_state, "combo:Beta", 5)
+                    record(
+                        "select_element (combo)",
+                        selected.startswith("selected")
+                        and "combo:Beta" in combo_state,
+                        selected[:100],
+                    )
+
+                    table, _ = await call(
+                        session, "read_table", target="TestList", window=uia_title,
+                        max_rows=12,
+                    )
+                    record(
+                        "read_table (list)",
+                        "Row One" in table and "Row Three" in table,
+                        table.splitlines()[0][:90] if table else "no text",
+                    )
+
+                    grid, _ = await call(
+                        session, "read_table", target="TestGrid", window=uia_title
+                    )
+                    record(
+                        "read_table (grid)",
+                        "Alpha" in grid and "Gamma" in grid,
+                        grid.splitlines()[0][:90] if grid else "no text",
+                    )
+
+                    # Virtualized lists only expose visible rows, so scroll the
+                    # container first; scroll_into_view then verifies/repairs the
+                    # target's position inside the window.
+                    scrolled_list, _ = await call(
+                        session, "scroll", amount=-30, target="TestList",
+                        window=uia_title,
+                    )
+                    record(
+                        "scroll (targeted list)",
+                        "via ScrollPattern" in scrolled_list,
+                        scrolled_list[:100],
+                    )
+                    await call(
+                        session, "scroll", amount=50, target="TestList",
+                        window=uia_title,
+                    )
+                    await asyncio.sleep(0.4)
+                    scrolled, _ = await call(
+                        session, "scroll_into_view", target="Item 60", window=uia_title
+                    )
+                    record(
+                        "scroll_into_view",
+                        scrolled.startswith("scrolled") and "visible=True" in scrolled,
+                        scrolled[:100],
                     )
 
                     dragged, _ = await call(
-                        session,
-                        "drag_element",
-                        source="Cancel",
-                        destination="Open:",
-                        window="Run",
+                        session, "drag_element", source="Row One",
+                        destination="Row Three", window=uia_title,
                     )
                     record(
-                        "drag_element",
+                        "drag_element (scratch UIA)",
                         dragged.startswith("dragged")
-                        and "Cancel" in dragged
-                        and "Open:" in dragged,
-                        dragged[:90],
+                        and "Row One" in dragged and "Row Three" in dragged,
+                        dragged[:100],
                     )
 
                     mod_clicked, _ = await call(
-                        session,
-                        "click_element",
-                        target="Open:",
-                        window="Run",
-                        modifiers="ctrl",
+                        session, "click_element", target="Row Two",
+                        window=uia_title, modifiers="ctrl",
                     )
                     record(
                         "click_element (modifier)",
@@ -426,56 +599,143 @@ async def main() -> int:
                         mod_clicked[:90],
                     )
 
-                    typed, _ = await call(
-                        session,
-                        "set_element_text",
-                        target="Open:",
-                        text="opencode-selftest",
-                        window="Run",
+                    menu_reply, _ = await call(
+                        session, "menu", path="File > Test Action", window=uia_title
                     )
-                    record("set_element_text", typed.startswith("set"), typed[:90])
+                    menu_state = await wait_state(uia_state, "menu-clicked", 5)
+                    record(
+                        "menu (File > Test Action)",
+                        menu_reply.startswith("menu:") and "menu-clicked" in menu_state,
+                        menu_reply[:100],
+                    )
 
-                    read, _ = await call(
-                        session, "read_element", target="Open:", window="Run"
+                    highlighted, _ = await call(
+                        session, "highlight_element", target="TestButton",
+                        window=uia_title,
                     )
-                    record("read_element", "opencode-selftest" in read, read[:90])
+                    record(
+                        "highlight_element",
+                        highlighted.startswith("highlighted"),
+                        highlighted[:90],
+                    )
 
-                    clicked, _ = await call(
-                        session, "click_element", target="Cancel", window="Run"
+                    idle, _ = await call(
+                        session, "wait_for_idle", window=uia_title,
+                        idle_ms=500, timeout=6, include_tree=False,
                     )
-                    record("click_element", clicked.startswith("clicked"), clicked[:90])
+                    record("wait_for_idle", idle.startswith("idle after"), idle[:90])
 
-                    closed_wait, _ = await call(
-                        session, "wait_for_window", title="Run", timeout=6, state="close"
+                    changed, _ = await call(
+                        session, "wait_for_change", window=uia_title,
+                        timeout=6, threshold=0.01,
                     )
-                    run_open = not (
-                        closed_wait.startswith("closed after")
-                        or closed_wait.startswith("already closed")
-                    )
-                    record("wait_for_window (close)", not run_open, closed_wait[:90])
+                    record("wait_for_change", changed.startswith("changed after"), changed[:100])
 
+                    await call(
+                        session, "click_element", target="HideMe", window=uia_title
+                    )
+                    hidden_state = await wait_state(uia_state, "hidden", 5)
                     gone, _ = await call(
-                        session,
-                        "wait_for_element",
-                        target="Cancel",
-                        window="Run",
-                        timeout=3,
-                        state="close",
+                        session, "wait_for_element", target="Hide Me",
+                        window=uia_title, timeout=3, state="close",
                     )
                     record(
                         "wait_for_element (close)",
-                        gone.startswith("closed after") or gone.startswith("already absent"),
-                        gone[:90],
+                        "hidden" in hidden_state
+                        and (
+                            gone.startswith("disappeared")
+                            or gone.startswith("already absent")
+                        ),
+                        gone[:100],
+                    )
+                    never, _ = await call(
+                        session, "wait_for_element", target="Never Exists",
+                        window=uia_title, timeout=1.2, state="close",
+                        must_exist=True,
                     )
                     record(
-                        "run dialog closed",
-                        not run_open,
-                        "still open" if run_open else "closed",
+                        "wait_for_element (never appeared)",
+                        never.startswith("timed out") and "never present" in never,
+                        never[:100],
                     )
+
+                    await call(
+                        session, "click_element", target="OpenDialog", window=uia_title
+                    )
+                    dialog_waited, _ = await call(
+                        session, "wait_for_window", title="Computer-use file dialog",
+                        timeout=8,
+                    )
+                    dialog_open = dialog_waited.startswith("appeared after")
+                    record("file dialog opened", dialog_open, dialog_waited[:90])
+                    if dialog_open:
+                        target_file = os.path.join(
+                            tempfile.gettempdir(),
+                            f"opencode-file-{uuid.uuid4().hex[:8]}.txt",
+                        )
+                        filled, _ = await call(
+                            session, "file_dialog", path=target_file,
+                            action="open", window="Computer-use file dialog",
+                        )
+                        file_state = await wait_state(uia_state, "file:", 5)
+                        record(
+                            "file_dialog",
+                            filled.startswith("open:")
+                            and "file:" in file_state
+                            and target_file.lower() in file_state.lower(),
+                            filled[:110],
+                        )
+                        try:
+                            os.remove(target_file)
+                        except OSError:
+                            pass
+
+                    paused, _ = await call(session, "pause", action="on")
+                    blocked, _ = await call(session, "click", x=1, y=1)
+                    resumed, _ = await call(session, "pause", action="off")
+                    record(
+                        "pause blocks actions",
+                        paused.startswith("automation paused")
+                        and blocked.startswith("PAUSED")
+                        and resumed.startswith("automation running"),
+                        f"{paused[:22]} / {blocked[:22]} / {resumed[:24]}",
+                    )
+                    released, _ = await call(session, "release_all")
+                    record("release_all", released.startswith("released"), released[:90])
+
+                    if '"tesseract": "not installed' in status:
+                        record(
+                            "find_text / click_text (OCR)", True,
+                            "Tesseract not installed; skipped",
+                        )
+                    else:
+                        ocr_found, _ = await call(
+                            session, "find_text", text="Test Button", window=uia_title
+                        )
+                        ocr_clicked, _ = await call(
+                            session, "click_text", text="Test Button", window=uia_title
+                        )
+                        record(
+                            "find_text / click_text (OCR)",
+                            "OCR match" in ocr_found
+                            and ocr_clicked.startswith("clicked OCR text"),
+                            f"{ocr_found.splitlines()[0][:50]} / {ocr_clicked[:50]}",
+                        )
             finally:
-                if run_open:
-                    await call(session, "press_keys", keys="esc")
-                    await asyncio.sleep(0.4)
+                await call(
+                    session, "close_window", title="Computer-use file dialog", wait=0.5
+                )
+                await call(session, "close_window", title=uia_title, wait=2)
+                if uia_proc.poll() is None:
+                    uia_proc.terminate()
+                    try:
+                        uia_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        uia_proc.kill()
+                try:
+                    os.remove(uia_state)
+                except OSError:
+                    pass
 
             # --- launch with arguments + wait_for_window ------------------------
             # Starting a console app used to inherit the MCP server's stdio pipes

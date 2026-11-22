@@ -21,8 +21,15 @@
     Nothing is written to your global OpenCode config, PATH, or any machine-wide
     location. When OpenCode exits, the ability is gone.
 
+    On launch, a git checkout is checked against origin/main and fast-forwarded
+    only when it is clean and strictly behind. .runtime, vendor files and user
+    data are preserved; local commits and uncommitted edits are never
+    overwritten. Use -NoUpdate to skip the check.
+
     -ReadOnly (or --read-only) keeps the inspection tools but blocks every input,
-    window and launch action inside the MCP server.
+    window and launch action inside the MCP server. Ctrl+Alt+F12 pauses
+    automation at any time and releases held input. Every tool call is audited in
+    .runtime\logs\actions.log with typed text redacted.
 
 .PARAMETER Reinstall
     Delete and rebuild .runtime\venv from scratch.
@@ -38,6 +45,11 @@
 .PARAMETER ReadOnly
     Start with inspection tools only (snapshot, tree, screenshots, reads, waits).
     Every mouse, keyboard, window and launch action is blocked by the MCP server.
+
+.PARAMETER NoUpdate
+    Skip the startup check for newer commits on GitHub. Auto-update only
+    fast-forwards a clean checkout; local commits or uncommitted files are left
+    alone.
 
 .EXAMPLE
     .\Computer-Use.cmd
@@ -67,6 +79,7 @@ param(
     [switch]$SelfTest,
     [switch]$PrepareVendor,
     [switch]$ReadOnly,
+    [switch]$NoUpdate,
     # Everything else (including `pair` and `-Directory <path>`) is parsed here.
     # Keeping a typed positional -Directory parameter would swallow `pair`.
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -83,6 +96,7 @@ $startDirectory = (Get-Location).Path
 # manually because PowerShell would otherwise bind the `pair` subcommand to it.
 $readOnlyMode = $ReadOnly.IsPresent
 if ($env:COMPUTER_USE_READ_ONLY -match '^(1|true|yes|on)$') { $readOnlyMode = $true }
+$noUpdateMode = $NoUpdate.IsPresent
 $directoryArgument = $null
 $directoryError = ""
 $filteredArgs = @()
@@ -91,6 +105,8 @@ for ($index = 0; $index -lt $rawArgs.Count; $index++) {
     $argument = [string]$rawArgs[$index]
     if ($argument -ieq "--read-only") {
         $readOnlyMode = $true
+    } elseif ($argument -ieq "--no-update") {
+        $noUpdateMode = $true
     } elseif ($argument -ieq "-Directory" -or $argument -ieq "--directory") {
         if ($index + 1 -ge $rawArgs.Count) {
             $directoryError = "-Directory requires a folder path."
@@ -142,6 +158,58 @@ function Fail {
     param([string]$Message)
     Write-Host ("`n[computer-use] {0}" -f $Message) -ForegroundColor Red
     exit 1
+}
+
+# Keep this checkout current without ever overwriting local work: only a clean
+# checkout that is strictly behind origin/main is fast-forwarded. The running
+# PowerShell process keeps its parsed copy, so launcher changes apply next run;
+# the MCP server (started later) uses the updated files immediately.
+function Update-LauncherRepo {
+    if ($noUpdateMode) { return }
+    if (-not (Test-Path (Join-Path $script:Root ".git"))) { return }
+    $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $git) {
+        Write-Step "Update check skipped: git is not installed."
+        return
+    }
+    $env:GIT_TERMINAL_PROMPT = "0"
+    Write-Step "Checking GitHub for launcher updates..."
+    # Do not pipe git through Select-Object -First 1: stopping the pipeline
+    # early sets $LASTEXITCODE to -1 even when git succeeded.
+    $before = @(& $git.Source -C $script:Root rev-parse HEAD 2>$null)[0]
+    if ($LASTEXITCODE -ne 0 -or -not $before) {
+        Write-Step "Update check skipped: this folder is not a git checkout."
+        return
+    }
+    & $git.Source -C $script:Root fetch --quiet origin main 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Update check skipped: git fetch failed (offline or no access)."
+        return
+    }
+    $remote = @(& $git.Source -C $script:Root rev-parse origin/main 2>$null)[0]
+    if (-not $remote -or $remote -eq $before) {
+        Write-Step "Launcher is up to date."
+        return
+    }
+    & $git.Source -C $script:Root merge-base --is-ancestor $before $remote 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Local commits differ from GitHub; auto-update skipped."
+        return
+    }
+    $dirty = (& $git.Source -C $script:Root status --porcelain 2>$null)
+    if ($dirty) {
+        Write-Warn "Uncommitted local changes present; auto-update skipped."
+        return
+    }
+    Write-Step "Newer commits found; fast-forwarding this checkout..."
+    & $git.Source -C $script:Root pull --ff-only --quiet origin main 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $after = @(& $git.Source -C $script:Root rev-parse --short HEAD 2>$null)[0]
+        Write-Ok "Updated launcher to $after (server changes apply now; launcher changes next run)."
+    } else {
+        Write-Warn "Auto-update failed; continuing with the local version."
+    }
 }
 
 if ($directoryError) { Fail $directoryError }
@@ -368,6 +436,8 @@ function Resolve-Uv {
 Write-Host ""
 Write-Host "  OpenCode + computer use (this session only)" -ForegroundColor Cyan
 Write-Host "  ------------------------------------------" -ForegroundColor DarkCyan
+
+Update-LauncherRepo
 
 if (-not (Test-Path $script:ServerScript)) {
     Fail "Missing $script:ServerScript. Keep the scripts folder next to Computer-Use.cmd."

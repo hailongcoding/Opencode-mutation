@@ -14,6 +14,7 @@ set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.
     echo Launcher exited with code %RC%.
-    pause
+    rem Pause only in an interactive console; scripted runs must not hang.
+    powershell -NoProfile -Command "if (-not [Console]::IsInputRedirected -and [Environment]::UserInteractive) { Write-Host 'Press Enter to close...'; [void][Console]::ReadLine() }"
 )
 exit /b %RC%
