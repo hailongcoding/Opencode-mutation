@@ -153,6 +153,10 @@ runtime entry is location-scoped, so other projects do not receive desktop tools
 For scripted use, set `COMPUTER_USE_PAIR_HOLD_SECONDS=<n>` to detach and clean up
 automatically after `n` seconds.
 
+Press Enter (or Ctrl+C) to detach; the launcher removes the runtime entry in a
+`finally` block. If the process is killed hard, the entry can remain, but the MCP
+lease makes it inert. Run `opencode service restart` to clear a stale entry.
+
 The paired browser/app is only a client. OpenCode, the MCP server and every tool
 call stay on this PC, scoped to the folder the launcher attaches. The phone or
 remote device needs no Python, no runtime and no computer-use install.
@@ -355,7 +359,9 @@ background process after detach.
 - Prefer `snapshot`/`click_element`/`set_element_text` over blind pixel clicks.
   When an app exposes no accessibility tree, fall back to a screenshot.
 - The server can run arbitrary GUI actions as your user; treat every session like
-  handing someone your desktop.
+  handing someone your desktop. Auto-update itself is not an MCP tool and adds no
+  repo/shell capability, but the general `launch`/`type_text` tools still run as
+  your user, so the session is not a sandbox.
 - `ui_tree`, `screenshot` and clipboard reads expose whatever is on screen or in
   your clipboard to the model you are chatting with.
 - Use it on a machine you control, and watch the first few runs.

@@ -188,7 +188,11 @@ function Update-LauncherRepo {
         return
     }
     $remote = @(& $git.Source -C $script:Root rev-parse origin/main 2>$null)[0]
-    if (-not $remote -or $remote -eq $before) {
+    if (-not $remote) {
+        Write-Warn "Update check skipped: origin/main was not found."
+        return
+    }
+    if ($remote -eq $before) {
         Write-Step "Launcher is up to date."
         return
     }
