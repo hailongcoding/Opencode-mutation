@@ -96,6 +96,19 @@ cd C:\Users\Admin\projects\demo
 .\Computer-Use.cmd --prompt "Open Notepad and type hello"
 ```
 
+### Startup warning
+
+Once the runtime is ready and just before OpenCode starts, the launcher shows a
+short banner explaining what is about to be attached: full desktop control, or
+read-only inspection. It then counts down for **four seconds**; press any key to
+start OpenCode immediately. The banner names the project folder, the
+**Ctrl+Alt+F12** pause hotkey and the audit log, so the last thing on screen
+before the session opens is the scope of the grant.
+
+Scripted launches never wait: if input is redirected or the session is not
+interactive, the countdown is skipped. Pair mode does not launch OpenCode locally
+and is unaffected.
+
 ### Launcher updates
 
 When this folder is a git checkout, the launcher checks GitHub `origin/main` at

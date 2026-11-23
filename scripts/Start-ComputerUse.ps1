@@ -31,6 +31,10 @@
     automation at any time and releases held input. Every tool call is audited in
     .runtime\logs\actions.log with typed text redacted.
 
+    Immediately before OpenCode starts, the launcher shows a short warning and a
+    four-second countdown; any key starts OpenCode immediately. When input is
+    redirected, the countdown is skipped so scripted launches never block.
+
 .PARAMETER Reinstall
     Delete and rebuild .runtime\venv from scratch.
 
@@ -158,6 +162,54 @@ function Fail {
     param([string]$Message)
     Write-Host ("`n[computer-use] {0}" -f $Message) -ForegroundColor Red
     exit 1
+}
+
+# Last thing shown before OpenCode takes over the console. The countdown gives
+# the human a few seconds to read what is about to be attached; any key skips it.
+# Redirected or non-interactive input never blocks a scripted launch.
+function Show-ComputerUseWarning {
+    param([int]$Seconds = 4)
+
+    $rule = "  " + ("-" * 68)
+    Write-Host ""
+    Write-Host $rule -ForegroundColor DarkYellow
+    if ($readOnlyMode) {
+        Write-Host "   COMPUTER USE ATTACHED - READ-ONLY" -ForegroundColor Yellow
+        Write-Host "   This session can inspect your screen, but it cannot click," -ForegroundColor Yellow
+        Write-Host "   type, press keys, move/close windows, or launch programs." -ForegroundColor Yellow
+    } else {
+        Write-Host "   COMPUTER USE ATTACHED - FULL DESKTOP CONTROL" -ForegroundColor Red
+        Write-Host "   This session can see your screen, move the mouse, type, press" -ForegroundColor Red
+        Write-Host "   keys, and open, move or close windows and programs." -ForegroundColor Red
+    }
+    Write-Host $rule -ForegroundColor DarkYellow
+    Write-Step "Project folder: $runDirectory"
+    Write-Step "Pause automation: Ctrl+Alt+F12    Audit log: .runtime\logs\actions.log"
+    Write-Step "Close OpenCode (or press Ctrl+C) to detach. Nothing stays enabled."
+    Write-Host ""
+
+    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
+        Write-Step "Non-interactive launch: skipping the warning countdown."
+        return
+    }
+
+    $remaining = [Math]::Max(1, $Seconds)
+    while ($remaining -gt 0) {
+        Write-Host ("`r  Starting OpenCode in {0}... (press any key to start now)" -f $remaining) -NoNewline -ForegroundColor Cyan
+        $tick = [DateTime]::UtcNow.AddSeconds(1)
+        while ([DateTime]::UtcNow -lt $tick) {
+            if ([Console]::KeyAvailable) {
+                $null = [Console]::ReadKey($true)
+                Write-Host ("`r" + (" " * 72) + "`r") -NoNewline
+                Write-Host "  Key pressed - starting OpenCode now." -ForegroundColor Cyan
+                return
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        $remaining--
+    }
+    Write-Host ("`r" + (" " * 72) + "`r") -NoNewline
+    Write-Host "  Starting OpenCode now." -ForegroundColor Cyan
 }
 
 # Keep this checkout current without ever overwriting local work: only a clean
@@ -864,6 +916,8 @@ if ($readOnlyMode) {
 Write-Step "Session token: $($token.Substring(0, 8))... (dies with this process)"
 Write-Step "Working folder: $runDirectory"
 Write-Step "No global config was modified. Ctrl+C / exit OpenCode to detach."
+
+Show-ComputerUseWarning
 
 $arguments = @("--standalone")
 if ($Directory) { $arguments += $Directory }
